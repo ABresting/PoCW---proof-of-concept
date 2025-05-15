@@ -61,11 +61,17 @@ func main() {
 		fmt.Printf("!!! N1 Write k1 failed: %v\n", err)
 	}
 
+	// waiting to network level sync
+	time.Sleep(1 * time.Second)
+
 	fmt.Println("\n---> Step 2: N1 writes k2=v2 (sends to N2)")
 	err = node1.Write("k2", "v2", node2.EthAddress)
 	if err != nil {
 		fmt.Printf("!!! N1 Write k2 failed: %v\n", err)
 	}
+
+	// waiting to network level sync
+	time.Sleep(1 * time.Second)
 
 	fmt.Println("\n---> Step 3: N1 writes k3=v3 (sends to N3 - N3 is behind)")
 	err = node1.Write("k3", "v3", node3.EthAddress)
@@ -73,11 +79,17 @@ func main() {
 		fmt.Printf("!!! N1 Write k3 failed: %v\n", err)
 	}
 
+	// waiting to network level sync
+	time.Sleep(1 * time.Second)
+
 	fmt.Println("\n---> Step 4: N1 writes k4=v4 (sends to N1 - N2 is behind)")
 	err = node1.Write("k4", "v4", node2.EthAddress)
 	if err != nil {
 		fmt.Printf("!!! N1 Write k4 failed: %v\n", err)
 	}
+
+	// waiting to network level sync
+	time.Sleep(1 * time.Second)
 
 	fmt.Println("\n---> Step 5: N2 writes k5=v5 (sends to N2 - N3 is behind)")
 	err = node2.Write("k5", "v5", node3.EthAddress)

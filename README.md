@@ -38,11 +38,11 @@ Node 1:
   Store: map[k1:v1 k2:v2 k3:v3 k4:v4]
 
 Node 2:
-  Clock: map[1:4 2:1]
+  Clock: map[1:4 2:4]
   Store: map[k1:v1 k2:v2 k5:v5]
 
 Node 3:
-  Clock: map[1:3 2:1]
+  Clock: map[1:4 2:4 3:2]
   Store: map[k3:v3 k5:v5]
 
 ## Note - Proof of Causal Work - Blockchain integration
