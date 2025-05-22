@@ -1,0 +1,36 @@
+version: "3.5"
+
+services:
+  zero:
+    image: dgraph/dgraph:v23.1.0
+    container_name: dgraph_zero
+    ports:
+      - "5080:5080"
+      - "6080:6080"
+    volumes:
+      - dgraph_zero:/dgraph
+    command: dgraph zero --my=zero:5080
+
+  alpha:
+    image: dgraph/dgraph:v23.1.0
+    container_name: dgraph_alpha
+    ports:
+      - "8080:8080"  # HTTP (REST/Ratel)
+      - "9080:9080"  # gRPC (Go clients)
+    volumes:
+      - dgraph_alpha:/dgraph
+    command: dgraph alpha --my=alpha:7080 --zero=zero:5080 --security whitelist=0.0.0.0/0
+    depends_on:
+      - zero
+
+  ratel:
+    image: dgraph/ratel:latest
+    container_name: dgraph_ratel
+    ports:
+      - "8000:8000"
+    depends_on:
+      - alpha
+
+volumes:
+  dgraph_zero:
+  dgraph_alpha:

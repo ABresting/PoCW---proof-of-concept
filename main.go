@@ -2,14 +2,21 @@ package main
 
 import (
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
+	"github.com/yourorg/p2p-framework/chrono"
 	"github.com/yourorg/p2p-framework/client"
+	"github.com/yourorg/p2p-framework/dgraph"
+	"github.com/yourorg/p2p-framework/models"
 )
 
 func main() {
+	// Initialize Dgraph
+	dgraph.InitDgraph("localhost:9080")
+
 	// Keys & Node Creation
 	privateKey1 := "fad9c8855b740a0b7ed4c221dbad0f33a83a49cad6b3fe8d5817ac83d38b6a19" // N1
 	privateKey2 := "a1b2c3d4e5f67890123456789abcdef123456789abcdef123456789abcdef123" // N2
@@ -91,10 +98,10 @@ func main() {
 	// waiting to network level sync
 	time.Sleep(1 * time.Second)
 
-	fmt.Println("\n---> Step 5: N2 writes k5=v5 (sends to N2 - N3 is behind)")
+	fmt.Println("\n---> Step 5: N2 writes k5=v5 (sends to N3 - N3 is behind)")
 	err = node2.Write("k5", "v5", node3.EthAddress)
 	if err != nil {
-		fmt.Printf("!!! N2 Write k4 failed: %v\n", err)
+		fmt.Printf("!!! N2 Write k5 failed: %v\n", err)
 	}
 	// waiting to network level sync
 	time.Sleep(2 * time.Second)
@@ -105,8 +112,15 @@ func main() {
 	printFinalState(2, node2)
 	printFinalState(3, node3)
 
+	// Force commit of any pending events to Dgraph
+	fmt.Println("\nCommitting event graphs to Dgraph...")
+
+	// Build and commit CHRONO graph from final node states
+	buildChronoGraph([]*client.Client{node1, node2, node3})
+
 	fmt.Println("\n--- Execution Complete ---")
-	time.Sleep(1 * time.Second)
+	fmt.Println("Chrono event graph committed to Dgraph.")
+	time.Sleep(3 * time.Second)
 }
 
 func printFinalState(id int, node *client.Client) {
@@ -117,4 +131,119 @@ func printFinalState(id int, node *client.Client) {
 	fmt.Printf("  Clock: %v\n", node.Clock.Values)
 	fmt.Printf("  Store: %v\n", node.GetStore()) // GetStore handles its own locking
 	node.ClockMu.RUnlock()
+}
+
+// buildChronoGraph reconstructs a CHRONO causal event graph from the final states of all nodes
+func buildChronoGraph(nodes []*client.Client) {
+	graph := chrono.NewEventGraph(0, "reconstructed")
+
+	eventByKey := make(map[string]string)
+	nodeEvents := make(map[uint64][]models.EventInfo)
+	lastEventPerNode := make(map[uint64]string)
+
+	nodeIDs := make([]uint64, 0, len(nodes))
+	nodesByID := make(map[uint64]*client.Client)
+	for _, node := range nodes {
+		nodeIDs = append(nodeIDs, node.ID)
+		nodesByID[node.ID] = node
+	}
+
+	for _, node := range nodes {
+		nodeStore := node.GetStore()
+
+		events := make([]models.EventInfo, 0, len(nodeStore))
+		for k, v := range nodeStore {
+			eventName := fmt.Sprintf("%s:%s", k, v)
+
+			keyNum := 0
+			if len(k) > 1 {
+				fmt.Sscanf(k[1:], "%d", &keyNum)
+			}
+
+			events = append(events, models.EventInfo{
+				Key:       k,
+				Value:     v,
+				EventName: eventName,
+				KeyNum:    keyNum,
+				NodeID:    node.ID,
+			})
+		}
+
+		sort.Slice(events, func(i, j int) bool {
+			return events[i].KeyNum < events[j].KeyNum
+		})
+
+		nodeEvents[node.ID] = events
+	}
+
+	allEvents := make([]models.EventInfo, 0)
+	for _, events := range nodeEvents {
+		allEvents = append(allEvents, events...)
+	}
+
+	sort.Slice(allEvents, func(i, j int) bool {
+		return allEvents[i].KeyNum < allEvents[j].KeyNum
+	})
+
+	for _, e := range allEvents {
+		if _, exists := eventByKey[e.EventName]; exists {
+			continue
+		}
+
+		parentIDs := make([]string, 0)
+
+		if e.KeyNum > 1 {
+			prevKey := fmt.Sprintf("k%d", e.KeyNum-1)
+			for _, v := range nodes {
+				store := v.GetStore()
+				if prevValue, exists := store[prevKey]; exists {
+					prevEventName := fmt.Sprintf("%s:%s", prevKey, prevValue)
+					if prevEventID, ok := eventByKey[prevEventName]; ok {
+						parentIDs = append(parentIDs, prevEventID)
+						break
+					}
+				}
+			}
+		}
+
+		if len(parentIDs) == 0 && len(lastEventPerNode) > 0 {
+			if lastID, ok := lastEventPerNode[e.NodeID]; ok && lastID != "" {
+				parentIDs = append(parentIDs, lastID)
+			} else {
+				for _, lastID := range lastEventPerNode {
+					if lastID != "" {
+						parentIDs = append(parentIDs, lastID)
+						break
+					}
+				}
+			}
+		}
+
+		nodeClock := nodesByID[e.NodeID].Clock.Copy()
+
+		clock := make(map[int]int)
+		for _, nID := range nodeIDs {
+			if nID == e.NodeID {
+				clock[int(nID)] = e.KeyNum
+			} else if finalVal, ok := nodeClock.Values[nID]; ok && finalVal > 0 {
+				proportion := float64(e.KeyNum) / float64(len(allEvents))
+				estimatedVal := int(float64(finalVal) * proportion)
+				if estimatedVal > 0 {
+					clock[int(nID)] = estimatedVal
+				}
+			}
+		}
+
+		fmt.Printf("Creating event %s with parents: %v\n", e.EventName, parentIDs)
+		eventID := graph.AddEvent(e.EventName, e.Key, e.Value, clock, parentIDs)
+
+		eventByKey[e.EventName] = eventID
+		lastEventPerNode[e.NodeID] = eventID
+	}
+
+	if err := graph.CommitToGraph(); err != nil {
+		fmt.Printf("Error committing reconstructed graph: %v\n", err)
+	} else {
+		fmt.Println("Successfully committed reconstructed CHRONO graph to Dgraph")
+	}
 }
