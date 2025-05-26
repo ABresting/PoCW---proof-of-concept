@@ -995,8 +995,8 @@ func (c *Client) handleEpochVote(msg *message.Message) {
 			c.kvStoreMu.Unlock()
 
 			// Then broadcast to all peers using direct message sending rather than Write
-			for peerAddr := range c.Peers {
-				if peerAddr == c.EthAddress {
+			for peerEthAddr := range c.Peers {
+				if peerEthAddr == c.EthAddress {
 					continue
 				}
 
@@ -1012,7 +1012,7 @@ func (c *Client) handleEpochVote(msg *message.Message) {
 					},
 				}
 
-				msgToSend := message.NewRequestMessage(c.EthAddress, peerAddr, reqID, requestPayload, clockCopy, "")
+				msgToSend := message.NewRequestMessage(c.EthAddress, peerEthAddr, reqID, requestPayload, clockCopy, "")
 
 				if err := c.signMessage(msgToSend); err != nil {
 					fmt.Printf("Node %d: Failed to sign milestone message: %v\n", c.ID, err)
@@ -1020,9 +1020,9 @@ func (c *Client) handleEpochVote(msg *message.Message) {
 				}
 
 				if err := c.sendMessage("", msgToSend); err != nil {
-					fmt.Printf("Node %d: Failed to send milestone to %s: %v\n", c.ID, peerAddr, err)
+					fmt.Printf("Node %d: Failed to send milestone to %s: %v\n", c.ID, peerEthAddr, err)
 				} else {
-					fmt.Printf("Node %d: Broadcast milestone M:%d to %s\n", c.ID, epochNumber, peerAddr)
+					fmt.Printf("Node %d: Broadcast milestone M:%d to %s\n", c.ID, epochNumber, peerEthAddr)
 				}
 			}
 		}
@@ -1156,106 +1156,196 @@ func (c *Client) recordMessageEvent(msg *message.Message, _ string) string {
 
 	// Handle milestone events (M:X:Y format)
 	if strings.HasPrefix(key, "M") && key != "M0" {
-		// Connect milestone to previous milestone if one exists
-		if c.milestoneCreated && c.lastMilestone != "" {
-			milestoneKey := ""
-			for storedName, eventID := range c.lastMessageEvents {
-				if eventID == c.lastMilestone && strings.HasPrefix(storedName, "M") {
-					milestoneKey = storedName
-					break
-				}
+		// Milestones should connect to the CAUSALLY LATEST KEY-VALUE EVENT of their epoch
+		// Find the causally most recent non-milestone event using vector clocks
+		latestKeyEventID := ""
+		latestKeyEventClock := make(map[int]int)
+
+		for storedName, eventID := range c.lastMessageEvents {
+			// Skip milestone events, timestamp entries, clock entries, and latest_from_node entries
+			if strings.HasPrefix(storedName, "M") ||
+				strings.HasPrefix(storedName, "timestamp_") ||
+				strings.HasPrefix(storedName, "clock_") ||
+				strings.HasPrefix(storedName, "latest_from_node_") {
+				continue
 			}
 
-			if milestoneKey != eventName {
-				parentIDs = append(parentIDs, c.lastMilestone)
-				fmt.Printf("Node %d: Milestone %s connected to previous milestone ID %s\n",
-					c.ID, eventName, c.lastMilestone)
+			// This is a key-value event, get its vector clock
+			clockKey := fmt.Sprintf("clock_%s", eventID)
+			if clockStr, exists := c.lastMessageEvents[clockKey]; exists {
+				eventClock := c.parseClockString(clockStr)
+
+				// If this is the first key-value event we're checking, use it as baseline
+				if latestKeyEventID == "" {
+					latestKeyEventID = eventID
+					latestKeyEventClock = eventClock
+				} else {
+					// Compare vector clocks to find the causally latest event
+					// An event A is causally later than B if A's clock dominates B's clock
+					isLater := true
+					isEarlier := true
+
+					// Check all nodes in both clocks
+					allNodes := make(map[int]bool)
+					for k := range eventClock {
+						allNodes[k] = true
+					}
+					for k := range latestKeyEventClock {
+						allNodes[k] = true
+					}
+
+					for nodeID := range allNodes {
+						eventValue := eventClock[nodeID]           // defaults to 0 if not present
+						latestValue := latestKeyEventClock[nodeID] // defaults to 0 if not present
+
+						if eventValue < latestValue {
+							isLater = false
+						}
+						if eventValue > latestValue {
+							isEarlier = false
+						}
+					}
+
+					// If this event is causally later (dominates the current latest), use it
+					if isLater && !isEarlier {
+						latestKeyEventID = eventID
+						latestKeyEventClock = eventClock
+					}
+					// If events are concurrent (incomparable), we could use a tie-breaker
+					// For now, we'll keep the first one found in concurrent cases
+				}
 			}
 		}
 
-		// If no previous milestone, connect to latest key event
-		if len(parentIDs) == 0 {
-			latestKeyNum := 0
-			var latestEventID string
-
+		if latestKeyEventID != "" {
+			parentIDs = append(parentIDs, latestKeyEventID)
+			fmt.Printf("Node %d: Milestone %s connected to causally latest key-value event ID %s (clock: %v)\n",
+				c.ID, eventName, latestKeyEventID, latestKeyEventClock)
+		} else {
+			// Fallback to genesis milestone if no key-value events found
 			for storedName, eventID := range c.lastMessageEvents {
-				if strings.Contains(storedName, ":") {
-					parts := strings.Split(storedName, ":")
-					if len(parts) > 0 && strings.HasPrefix(parts[0], "k") {
-						keyNum := 0
-						if len(parts[0]) > 1 {
-							fmt.Sscanf(parts[0][1:], "%d", &keyNum)
-						}
-						if keyNum > latestKeyNum {
-							latestKeyNum = keyNum
-							latestEventID = eventID
-						}
-					}
+				if strings.HasPrefix(storedName, "M0:") {
+					parentIDs = append(parentIDs, eventID)
+					fmt.Printf("Node %d: Milestone %s connected to genesis M0 (no key events found)\n",
+						c.ID, eventName)
+					break
 				}
-			}
-
-			if latestEventID != "" {
-				parentIDs = append(parentIDs, latestEventID)
-				fmt.Printf("Node %d: Milestone %s connected to latest key event ID %s\n",
-					c.ID, eventName, latestEventID)
 			}
 		}
 	} else {
 		// Handle regular key-value events
-		// First try to connect to latest non-genesis milestone
-		if c.milestoneCreated && c.lastMilestone != "" {
-			milestoneKey := ""
-			for storedName, eventID := range c.lastMessageEvents {
-				if eventID == c.lastMilestone && strings.HasPrefix(storedName, "M") {
-					milestoneKey = storedName
-					break
-				}
-			}
+		// Strategy: Use vector clock causality to find immediate causal predecessors
 
-			if milestoneKey != "" && !strings.HasPrefix(milestoneKey, "M0:") {
-				parentIDs = append(parentIDs, c.lastMilestone)
+		// Get the current event's vector clock
+		currentClock := make(map[int]int)
+		if msg.MsgClock != nil {
+			for k, v := range msg.MsgClock.Values {
+				currentClock[int(k)] = int(v)
 			}
 		}
 
-		// If no milestone to connect to, try other options
-		if len(parentIDs) == 0 {
-			// For local events, connect to previous event from same node
-			if senderID == int(c.ID) {
-				latestFromSenderKey := fmt.Sprintf("latest_from_node_%d", senderID)
-				if latestEventID, exists := c.lastMessageEvents[latestFromSenderKey]; exists {
-					parentIDs = append(parentIDs, latestEventID)
-				}
-			} else {
-				// For remote events, check for causal relationships
-				hasCausalRelationship := false
+		// Find immediate causal predecessors based on vector clock relationships
+		var causalPredecessors []string
 
-				if msg.MsgClock != nil && len(msg.MsgClock.Values) > 0 {
-					for nodeID, clockVal := range msg.MsgClock.Values {
-						if clockVal > 0 {
-							nodeLatestKey := fmt.Sprintf("latest_from_node_%d", nodeID)
-							if depEventID, exists := c.lastMessageEvents[nodeLatestKey]; exists {
-								parentIDs = append(parentIDs, depEventID)
-								hasCausalRelationship = true
-								break
+		// Check all existing events to see which ones are immediate causal predecessors
+		for storedName, eventID := range c.lastMessageEvents {
+			// Skip milestone events, timestamp entries, clock entries, and latest_from_node entries
+			if strings.HasPrefix(storedName, "M") ||
+				strings.HasPrefix(storedName, "timestamp_") ||
+				strings.HasPrefix(storedName, "clock_") ||
+				strings.HasPrefix(storedName, "latest_from_node_") {
+				continue
+			}
+
+			// Get the stored event's vector clock
+			clockKey := fmt.Sprintf("clock_%s", eventID)
+			if clockStr, exists := c.lastMessageEvents[clockKey]; exists {
+				storedClock := c.parseClockString(clockStr)
+
+				// Check if this stored event is an immediate causal predecessor
+				if c.isImmediateCausalPredecessor(storedClock, currentClock) {
+					causalPredecessors = append(causalPredecessors, eventID)
+				}
+			}
+		}
+
+		// If we found causal predecessors, use them
+		if len(causalPredecessors) > 0 {
+			parentIDs = append(parentIDs, causalPredecessors...)
+			fmt.Printf("Node %d: Key-value event %s connected to causal predecessors: %v\n",
+				c.ID, eventName, causalPredecessors)
+		} else {
+			// No causal predecessors found, connect to the most appropriate milestone
+			// Find the causally latest milestone using vector clocks, not timestamps
+			mostRecentMilestone := ""
+			mostRecentMilestoneClock := make(map[int]int)
+
+			for storedName, eventID := range c.lastMessageEvents {
+				if strings.HasPrefix(storedName, "M:") {
+					// Get the milestone's vector clock
+					clockKey := fmt.Sprintf("clock_%s", eventID)
+					if clockStr, exists := c.lastMessageEvents[clockKey]; exists {
+						milestoneClock := c.parseClockString(clockStr)
+
+						// If this is the first milestone we're checking, use it as baseline
+						if mostRecentMilestone == "" {
+							mostRecentMilestone = eventID
+							mostRecentMilestoneClock = milestoneClock
+						} else {
+							// Compare vector clocks to find the causally latest milestone
+							isLater := true
+							isEarlier := true
+
+							// Check all nodes in both clocks
+							allNodes := make(map[int]bool)
+							for k := range milestoneClock {
+								allNodes[k] = true
+							}
+							for k := range mostRecentMilestoneClock {
+								allNodes[k] = true
+							}
+
+							for nodeID := range allNodes {
+								milestoneValue := milestoneClock[nodeID]               // defaults to 0 if not present
+								currentLatestValue := mostRecentMilestoneClock[nodeID] // defaults to 0 if not present
+
+								if milestoneValue < currentLatestValue {
+									isLater = false
+								}
+								if milestoneValue > currentLatestValue {
+									isEarlier = false
+								}
+							}
+
+							// If this milestone is causally later, use it
+							if isLater && !isEarlier {
+								mostRecentMilestone = eventID
+								mostRecentMilestoneClock = milestoneClock
 							}
 						}
 					}
 				}
+			}
 
-				// Fallback to genesis milestone if no relationships found
-				if !hasCausalRelationship {
-					for storedName, eventID := range c.lastMessageEvents {
-						if strings.HasPrefix(storedName, "M0:") {
-							parentIDs = append(parentIDs, eventID)
-							break
-						}
+			if mostRecentMilestone != "" {
+				parentIDs = append(parentIDs, mostRecentMilestone)
+				fmt.Printf("Node %d: Key-value event %s connected to causally latest milestone ID %s (clock: %v)\n",
+					c.ID, eventName, mostRecentMilestone, mostRecentMilestoneClock)
+			} else {
+				// Connect to genesis milestone (M0)
+				for storedName, eventID := range c.lastMessageEvents {
+					if strings.HasPrefix(storedName, "M0:") {
+						parentIDs = append(parentIDs, eventID)
+						fmt.Printf("Node %d: Key-value event %s connected to genesis M0 ID %s (no milestones)\n",
+							c.ID, eventName, eventID)
+						break
 					}
 				}
 			}
 		}
 	}
 
-	// Final fallback - connect to genesis milestone (M0)
+	// Final fallback - connect to genesis milestone (M0) if no parents found
 	if len(parentIDs) == 0 && key != "M0" {
 		for storedName, eventID := range c.lastMessageEvents {
 			if strings.HasPrefix(storedName, "M0:") {
@@ -1280,14 +1370,14 @@ func (c *Client) recordMessageEvent(msg *message.Message, _ string) string {
 	// Track this event for future reference
 	c.lastMessageEvents[eventName] = eventID
 
-	// Store timestamp for the event
-	currentTime := time.Now().UnixNano()
-	timestampKey := fmt.Sprintf("timestamp_%s", eventID)
-	c.lastMessageEvents[timestampKey] = fmt.Sprintf("%d", currentTime)
-
 	// Update latest event pointer for this sender
 	latestFromSenderKey := fmt.Sprintf("latest_from_node_%d", senderID)
 	c.lastMessageEvents[latestFromSenderKey] = eventID
+
+	// Store vector clock for the event for causality checking
+	clockKey := fmt.Sprintf("clock_%s", eventID)
+	clockStr := fmt.Sprintf("%v", clock)
+	c.lastMessageEvents[clockKey] = clockStr
 
 	// Update milestone tracking if needed
 	if strings.HasPrefix(key, "M") {
@@ -1434,7 +1524,7 @@ func (c *Client) finalizeEpoch() {
 		msgToSend := message.NewRequestMessage(c.EthAddress, peerEthAddr, reqID, requestPayload, clockCopy, "")
 
 		if err := c.signMessage(msgToSend); err != nil {
-			fmt.Printf("Node %d: Failed to sign milestone message to %s: %v\n", c.ID, peerEthAddr, err)
+			fmt.Printf("Node %d: Failed to sign milestone message: %v\n", c.ID, err)
 			continue
 		}
 
@@ -1444,4 +1534,70 @@ func (c *Client) finalizeEpoch() {
 			fmt.Printf("Node %d: Broadcast milestone %s to %s\n", c.ID, milestoneKey, peerEthAddr)
 		}
 	}
+}
+
+func (c *Client) parseClockString(clockStr string) map[int]int {
+	eventClock := make(map[int]int)
+
+	// Simple parsing of clock format like "map[1:5 2:3]"
+	clockStr = strings.TrimPrefix(clockStr, "map[")
+	clockStr = strings.TrimSuffix(clockStr, "]")
+
+	if clockStr != "" {
+		pairs := strings.Split(clockStr, " ")
+		for _, pair := range pairs {
+			if strings.Contains(pair, ":") {
+				parts := strings.Split(pair, ":")
+				if len(parts) == 2 {
+					if key, err := strconv.Atoi(parts[0]); err == nil {
+						if value, err := strconv.Atoi(parts[1]); err == nil {
+							eventClock[key] = value
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return eventClock
+}
+
+// isImmediateCausalPredecessor checks if storedClock is an immediate causal predecessor of currentClock
+func (c *Client) isImmediateCausalPredecessor(storedClock, currentClock map[int]int) bool {
+	// For an event to be an immediate causal predecessor, it should be:
+	// 1. Exactly one step behind in the vector clock (not just any "happened before")
+	// 2. From the same node or a directly related communication
+
+	// Count how many clock values differ and by how much
+	differences := 0
+	totalDifference := 0
+
+	// Check all nodes in both clocks
+	allNodes := make(map[int]bool)
+	for k := range storedClock {
+		allNodes[k] = true
+	}
+	for k := range currentClock {
+		allNodes[k] = true
+	}
+
+	for nodeID := range allNodes {
+		storedValue := storedClock[nodeID]   // defaults to 0 if not present
+		currentValue := currentClock[nodeID] // defaults to 0 if not present
+
+		if storedValue > currentValue {
+			// Stored event is in the future relative to current - not a predecessor
+			return false
+		}
+
+		if currentValue > storedValue {
+			differences++
+			totalDifference += (currentValue - storedValue)
+		}
+	}
+
+	// For immediate causality, we want:
+	// - Exactly 1 or 2 clock positions to differ (indicating direct communication)
+	// - Total difference should be small (1-3 steps max)
+	return differences > 0 && differences <= 2 && totalDifference <= 3
 }
