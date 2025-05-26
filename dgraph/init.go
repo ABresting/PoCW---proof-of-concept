@@ -1,4 +1,4 @@
-package chrono
+package dgraph
 
 import (
 	"context"
@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/dgraph-io/dgo/v210/protos/api"
-	"github.com/yourorg/p2p-framework/dgraph"
 	"github.com/yourorg/p2p-framework/models"
 )
 
@@ -35,34 +34,10 @@ func NewEventGraph(nodeID int, nodeAddr string) *EventGraph {
 	}
 }
 
-// MaxClock returns the maximum of two vector clocks
-func MaxClock(a, b map[int]int) map[int]int {
-	res := make(map[int]int)
-
-	for k, v := range a {
-		res[k] = v
-	}
-
-	for k, v := range b {
-		if v > res[k] {
-			res[k] = v
-		}
-	}
-
-	return res
-}
-
 // VectorClockToString converts a vector clock to JSON string
 func VectorClockToString(vc map[int]int) string {
 	b, _ := json.Marshal(vc)
 	return string(b)
-}
-
-// StringToVectorClock converts a JSON string to vector clock
-func StringToVectorClock(s string) map[int]int {
-	var vc map[int]int
-	json.Unmarshal([]byte(s), &vc)
-	return vc
 }
 
 // AddEvent adds a new event to the graph
@@ -121,7 +96,7 @@ func (eg *EventGraph) CommitToGraph() error {
 		return fmt.Errorf("failed to marshal events: %v", err)
 	}
 
-	txn := dgraph.Dg.NewTxn()
+	txn := Dg.NewTxn()
 	defer txn.Discard(context.Background())
 
 	mu := &api.Mutation{
