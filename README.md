@@ -35,9 +35,58 @@ docker ps
 ## Running the Experiment
 
 ```bash
-# To view results for a specific node  - this command generate the graph of node 3 after the experiment
+# To view results for a specific node - this command generates the graph of node 3 after the experiment
 go run main.go -node=3
+
+# To view results for other individual nodes:
+go run main.go -node=1  # Generate graph for Node 1 only
+go run main.go -node=2  # Generate graph for Node 2 only
+go run main.go -node=4  # Generate graph for Node 4 only
 ```
+
+## Visualizing Event Graphs in Dgraph Ratel UI
+
+After running the experiment, you can visualize the event graphs using the Dgraph Ratel UI:
+
+1. **Access Ratel UI**: Open your browser and go to http://localhost:8000
+2. **Connect to Dgraph**: Make sure the connection is set to `localhost:8080` (this should be the default)
+3. **Query the Event Graph**: Use the following query to view all events and their causal relationships:
+
+```graphql
+{
+  events(func: has(id)) {
+    uid
+    id
+    name
+    key
+    value
+    node
+    parent {
+      uid
+      id
+      name
+    }
+  }
+}
+```
+
+This query will return:
+- **uid**: Dgraph's internal unique identifier
+- **id**: Event ID (e.g., e1_1, e2_3, etc.)
+- **name**: Event name in format "key:value" (e.g., "k1:v1", "M:1:1")
+- **key**: The key part of the event (e.g., "k1", "M:1")
+- **value**: The value part of the event (e.g., "v1", "1")
+- **node**: Which node created this event (1, 2, 3, or 4)
+- **parent**: Array of parent events showing causal dependencies
+
+### Understanding the Graph Structure
+
+- **Genesis Events (M0)**: Root events with no parents
+- **Key-Value Events (k1:v1, k2:v2, etc.)**: Regular data events
+- **Milestone Events (M:1:1, M:2:2, etc.)**: Consensus milestones that connect to events from their respective epochs
+- **Parent Relationships**: Show causal dependencies based on vector clock ordering
+
+The visualization will display the complete causal graph showing how events are connected across all nodes in the distributed system.
 
 ## Explanation
 

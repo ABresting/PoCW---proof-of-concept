@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -11,11 +14,42 @@ import (
 	"github.com/yourorg/p2p-framework/dgraph"
 )
 
+// clearDgraph drops all data from the Dgraph instance
+func clearDgraph() error {
+	url := "http://localhost:8080/alter"
+	payload := map[string]bool{"drop_all": true}
+	
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal JSON: %v", err)
+	}
+	
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("failed to make POST request: %v", err)
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+	
+	fmt.Println("Successfully cleared Dgraph instance")
+	return nil
+}
+
 func main() {
 	// Parse command line flags
 	singleNodePtr := flag.Int("node", 0, "Specify a single node ID (1-4) to display only that node's graph, or 0 for all nodes")
 	flag.Parse()
 	singleNode := *singleNodePtr
+
+	// Clear Dgraph instance before starting
+	fmt.Println("Clearing Dgraph instance...")
+	if err := clearDgraph(); err != nil {
+		fmt.Printf("Warning: Failed to clear Dgraph: %v\n", err)
+		fmt.Println("Continuing anyway...")
+	}
 
 	// Initialize Dgraph
 	dgraph.InitDgraph("localhost:9080")

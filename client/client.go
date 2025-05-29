@@ -390,7 +390,7 @@ func (c *Client) checkCanApplyDirectWrite(incomingMsg *message.Message) (
 	comparison := localClock.Compare(remoteClock)
 	if comparison == vlc.Less { // We are strictly behind, and it's not a simple +1 increment
 		fmt.Printf("Node %d [G:%d]: Apply rule: GAP_DETECTED (local < remote, not +1). Requires Sync.\n", c.ID, goid())
-		return 0, true
+		return 0, false
 	}
 	// If local is Greater, Equal, or Incomparable (but not strictly Less and not +1)
 	fmt.Printf("Node %d [G:%d]: Apply rule: IGNORE/NO_ACTION (local %v vs remote %v, comp %d not meeting other criteria).\n", c.ID, goid(), localClock.Values, remoteClock.Values, comparison)
@@ -1155,48 +1155,119 @@ func (c *Client) recordMilestoneEvent(msg *message.Message, epochEvents []string
 		}
 	}
 
-	// SIMPLE LOGIC: Connect to ALL events that occurred causally before this milestone
-	// and are not already connected to it
 	parentIDs := make([]string, 0)
-	
-	// Get all existing events (excluding milestones, timestamps, clocks)
-	for storedName, eventID := range c.lastMessageEvents {
-		// Skip milestone events, timestamp entries, clock entries
-		if strings.HasPrefix(storedName, "M") ||
-			strings.HasPrefix(storedName, "timestamp_") ||
-			strings.HasPrefix(storedName, "clock_") ||
-			strings.HasPrefix(storedName, "latest_from_node_") {
-			continue
+
+	// CORRECTED LOGIC: Only connect to events from the current epoch
+	if len(epochEvents) > 0 {
+		// Use the provided epoch events - these are exactly the events from this epoch
+		parentIDs = append(parentIDs, epochEvents...)
+		fmt.Printf("Node %d: Milestone %s connecting to epoch events: %v\n",
+			c.ID, eventName, epochEvents)
+	} else {
+		// For received milestones, find events that occurred after the previous milestone
+		// but before this milestone (i.e., events from this epoch only)
+		
+		var milestoneNum int
+		if strings.HasPrefix(key, "M:") {
+			fmt.Sscanf(key, "M:%d", &milestoneNum)
 		}
 		
-		// Get the event's vector clock
-		clockKey := fmt.Sprintf("clock_%s", eventID)
-		if clockStr, exists := c.lastMessageEvents[clockKey]; exists {
-			eventClock := c.parseClockString(clockStr)
-			
-			// Check if this event occurred causally before the milestone
-			// An event occurred before if ALL its clock values are <= milestone clock values
-			occurredBefore := true
-			for nodeID, eventTime := range eventClock {
-				if milestoneTime, exists := milestoneClock[nodeID]; exists {
-					if eventTime > milestoneTime {
-						occurredBefore = false
-						break
-					}
-				} else {
-					// If milestone doesn't have this node's clock, event might be concurrent
-					occurredBefore = false
+		// Find the previous milestone
+		var previousMilestoneID string
+		if milestoneNum > 1 {
+			// Look for M:(milestoneNum-1) milestone
+			prevMilestoneKey := fmt.Sprintf("M:%d", milestoneNum-1)
+			for storedName, eventID := range c.lastMessageEvents {
+				if strings.HasPrefix(storedName, prevMilestoneKey+":") {
+					previousMilestoneID = eventID
 					break
 				}
 			}
+		} else {
+			// For M:1, the previous milestone is M0
+			for storedName, eventID := range c.lastMessageEvents {
+				if strings.HasPrefix(storedName, "M0:") {
+					previousMilestoneID = eventID
+					break
+				}
+			}
+		}
+		
+		if previousMilestoneID != "" {
+			// Get the previous milestone's vector clock
+			prevClockKey := fmt.Sprintf("clock_%s", previousMilestoneID)
+			var prevMilestoneClock map[int]int
+			if clockStr, exists := c.lastMessageEvents[prevClockKey]; exists {
+				prevMilestoneClock = c.parseClockString(clockStr)
+			}
 			
-			if occurredBefore {
-				parentIDs = append(parentIDs, eventID)
+			// Find all non-milestone events that occurred after the previous milestone
+			// but before this milestone (epoch events)
+			for storedName, eventID := range c.lastMessageEvents {
+				// Skip milestone events, timestamp entries, clock entries
+				if strings.HasPrefix(storedName, "M") ||
+					strings.HasPrefix(storedName, "timestamp_") ||
+					strings.HasPrefix(storedName, "clock_") ||
+					strings.HasPrefix(storedName, "latest_from_node_") {
+					continue
+				}
+				
+				// Get the event's vector clock
+				clockKey := fmt.Sprintf("clock_%s", eventID)
+				if clockStr, exists := c.lastMessageEvents[clockKey]; exists {
+					eventClock := c.parseClockString(clockStr)
+					
+					// Check if this event occurred after the previous milestone
+					// and before/at the current milestone
+					occurredAfterPrev := true
+					occurredBeforeCurrent := true
+					
+					// Compare with previous milestone clock
+					if prevMilestoneClock != nil {
+						for nodeID, prevTime := range prevMilestoneClock {
+							if eventTime, exists := eventClock[nodeID]; exists {
+								if eventTime <= prevTime {
+									occurredAfterPrev = false
+									break
+								}
+							}
+						}
+					}
+					
+					// Compare with current milestone clock
+					for nodeID, eventTime := range eventClock {
+						if milestoneTime, exists := milestoneClock[nodeID]; exists {
+							if eventTime > milestoneTime {
+								occurredBeforeCurrent = false
+								break
+							}
+						}
+					}
+					
+					// If event occurred after previous milestone and before current milestone,
+					// it's part of this epoch
+					if occurredAfterPrev && occurredBeforeCurrent {
+						parentIDs = append(parentIDs, eventID)
+					}
+				}
+			}
+			
+			fmt.Printf("Node %d: Received milestone %s connecting to epoch events (after prev milestone): %v\n",
+				c.ID, eventName, parentIDs)
+		} else {
+			// Fallback: connect to the most recent milestone if no epoch events found
+			for storedName, eventID := range c.lastMessageEvents {
+				if strings.HasPrefix(storedName, "M:") || strings.HasPrefix(storedName, "M0:") {
+					parentIDs = append(parentIDs, eventID)
+					fmt.Printf("Node %d: Received milestone %s connected to previous milestone (fallback)\n",
+						c.ID, eventName)
+					break
+				}
 			}
 		}
 	}
 
-	fmt.Printf("Node %d: Creating milestone %s with parents (all causally prior events): %v\n", 
+	fmt.Printf("Node %d: Creating milestone %s with parents (epoch events only): %v\n", 
 		c.ID, eventName, parentIDs)
 
 	// Add the event to the graph
