@@ -1226,7 +1226,7 @@ func (c *Client) recordMilestoneEvent(msg *message.Message, epochEvents []string
 					if prevMilestoneClock != nil {
 						for nodeID, prevTime := range prevMilestoneClock {
 							if eventTime, exists := eventClock[nodeID]; exists {
-								if eventTime <= prevTime {
+								if eventTime < prevTime {
 									occurredAfterPrev = false
 									break
 								}
