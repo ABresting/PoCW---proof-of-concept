@@ -18,22 +18,22 @@ import (
 func clearDgraph() error {
 	url := "http://localhost:8080/alter"
 	payload := map[string]bool{"drop_all": true}
-	
+
 	jsonData, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("failed to marshal JSON: %v", err)
 	}
-	
+
 	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
 		return fmt.Errorf("failed to make POST request: %v", err)
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
-	
+
 	fmt.Println("Successfully cleared Dgraph instance")
 	return nil
 }
@@ -153,63 +153,63 @@ func main() {
 	if err != nil {
 		fmt.Printf("!!! N1 Write k1 failed: %v\n", err)
 	}
-	time.Sleep(3 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	fmt.Println("\n---> Step 2: N2 writes k2=v2 (sends to N3)")
 	err = node2.Write("k2", "v2", node3.EthAddress)
 	if err != nil {
 		fmt.Printf("!!! N2 Write k2 failed: %v\n", err)
 	}
-	time.Sleep(3 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	fmt.Println("\n---> Step 3: N3 writes k3=v3 (sends to N4)")
 	err = node3.Write("k3", "v3", node4.EthAddress)
 	if err != nil {
 		fmt.Printf("!!! N3 Write k3 failed: %v\n", err)
 	}
-	time.Sleep(3 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	fmt.Println("\n---> Step 4: N4 writes k4=v4 (sends to N1)")
 	err = node4.Write("k4", "v4", node1.EthAddress)
 	if err != nil {
 		fmt.Printf("!!! N4 Write k4 failed: %v\n", err)
 	}
-	time.Sleep(3 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	fmt.Println("\n---> Step 5: N1 writes k5=v5 (sends to N2)")
 	err = node1.Write("k5", "v5", node2.EthAddress)
 	if err != nil {
 		fmt.Printf("!!! N1 Write k5 failed: %v\n", err)
 	}
-	time.Sleep(3 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	fmt.Println("\n---> Step 6: N2 writes k6=v6 (sends to N3)")
 	err = node2.Write("k6", "v6", node3.EthAddress)
 	if err != nil {
 		fmt.Printf("!!! N2 Write k6 failed: %v\n", err)
 	}
-	time.Sleep(3 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	fmt.Println("\n---> Step 7: N3 writes k7=v7 (sends to N4)")
 	err = node3.Write("k7", "v7", node4.EthAddress)
 	if err != nil {
 		fmt.Printf("!!! N3 Write k7 failed: %v\n", err)
 	}
-	time.Sleep(3 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	fmt.Println("\n---> Step 8: N4 writes k8=v8 (sends to N1)")
 	err = node4.Write("k8", "v8", node1.EthAddress)
 	if err != nil {
 		fmt.Printf("!!! N4 Write k8 failed: %v\n", err)
 	}
-	time.Sleep(3 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	fmt.Println("\n---> Step 9: N1 writes k9=v9 (sends to N2)")
 	err = node1.Write("k9", "v9", node2.EthAddress)
 	if err != nil {
 		fmt.Printf("!!! N1 Write k9 failed: %v\n", err)
 	}
-	time.Sleep(3 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	fmt.Println("\n---> Step 10: N2 writes k10=v10 (sends to N3) - This should trigger M1 creation")
 	err = node2.Write("k10", "v10", node3.EthAddress)
@@ -227,63 +227,63 @@ func main() {
 	if err != nil {
 		fmt.Printf("!!! N3 Write k11 failed: %v\n", err)
 	}
-	time.Sleep(3 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	fmt.Println("\n---> Step 12: N4 writes k12=v12 (sends to N1)")
 	err = node4.Write("k12", "v12", node1.EthAddress)
 	if err != nil {
 		fmt.Printf("!!! N4 Write k12 failed: %v\n", err)
 	}
-	time.Sleep(3 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	fmt.Println("\n---> Step 13: N1 writes k13=v13 (sends to N2)")
 	err = node1.Write("k13", "v13", node2.EthAddress)
 	if err != nil {
 		fmt.Printf("!!! N1 Write k13 failed: %v\n", err)
 	}
-	time.Sleep(3 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	fmt.Println("\n---> Step 14: N2 writes k14=v14 (sends to N3)")
 	err = node2.Write("k14", "v14", node3.EthAddress)
 	if err != nil {
 		fmt.Printf("!!! N2 Write k14 failed: %v\n", err)
 	}
-	time.Sleep(3 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	fmt.Println("\n---> Step 15: N3 writes k15=v15 (sends to N4)")
 	err = node3.Write("k15", "v15", node4.EthAddress)
 	if err != nil {
 		fmt.Printf("!!! N3 Write k15 failed: %v\n", err)
 	}
-	time.Sleep(3 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	fmt.Println("\n---> Step 16: N4 writes k16=v16 (sends to N1)")
 	err = node4.Write("k16", "v16", node1.EthAddress)
 	if err != nil {
 		fmt.Printf("!!! N4 Write k16 failed: %v\n", err)
 	}
-	time.Sleep(3 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	fmt.Println("\n---> Step 17: N1 writes k17=v17 (sends to N2)")
 	err = node1.Write("k17", "v17", node2.EthAddress)
 	if err != nil {
 		fmt.Printf("!!! N1 Write k17 failed: %v\n", err)
 	}
-	time.Sleep(3 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	fmt.Println("\n---> Step 18: N2 writes k18=v18 (sends to N3)")
 	err = node2.Write("k18", "v18", node3.EthAddress)
 	if err != nil {
 		fmt.Printf("!!! N2 Write k18 failed: %v\n", err)
 	}
-	time.Sleep(3 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	fmt.Println("\n---> Step 19: N3 writes k19=v19 (sends to N4)")
 	err = node3.Write("k19", "v19", node4.EthAddress)
 	if err != nil {
 		fmt.Printf("!!! N3 Write k19 failed: %v\n", err)
 	}
-	time.Sleep(3 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	fmt.Println("\n---> Step 20: N4 writes k20=v20 (sends to N1) - This should trigger M2 creation")
 	err = node4.Write("k20", "v20", node1.EthAddress)
@@ -301,28 +301,28 @@ func main() {
 	if err != nil {
 		fmt.Printf("!!! N1 Write k21 failed: %v\n", err)
 	}
-	time.Sleep(3 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	fmt.Println("\n---> Step 22: N2 writes k22=v22 (sends to N3)")
 	err = node2.Write("k22", "v22", node3.EthAddress)
 	if err != nil {
 		fmt.Printf("!!! N2 Write k22 failed: %v\n", err)
 	}
-	time.Sleep(3 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	fmt.Println("\n---> Step 23: N3 writes k23=v23 (sends to N4)")
 	err = node3.Write("k23", "v23", node4.EthAddress)
 	if err != nil {
 		fmt.Printf("!!! N3 Write k23 failed: %v\n", err)
 	}
-	time.Sleep(3 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	fmt.Println("\n---> Step 24: N4 writes k24=v24 (sends to N1)")
 	err = node4.Write("k24", "v24", node1.EthAddress)
 	if err != nil {
 		fmt.Printf("!!! N4 Write k24 failed: %v\n", err)
 	}
-	time.Sleep(3 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	fmt.Println("\n---> Step 25: N1 writes k25=v25 (sends to N2) - This should trigger M:2 creation")
 	err = node1.Write("k25", "v25", node2.EthAddress)
@@ -340,28 +340,28 @@ func main() {
 	if err != nil {
 		fmt.Printf("!!! N2 Write k26 failed: %v\n", err)
 	}
-	time.Sleep(3 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	fmt.Println("\n---> Step 27: N3 writes k27=v27 (sends to N4)")
 	err = node3.Write("k27", "v27", node4.EthAddress)
 	if err != nil {
 		fmt.Printf("!!! N3 Write k27 failed: %v\n", err)
 	}
-	time.Sleep(3 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	fmt.Println("\n---> Step 28: N4 writes k28=v28 (sends to N1)")
 	err = node4.Write("k28", "v28", node1.EthAddress)
 	if err != nil {
 		fmt.Printf("!!! N4 Write k28 failed: %v\n", err)
 	}
-	time.Sleep(3 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	fmt.Println("\n---> Step 29: N1 writes k29=v29 (sends to N2)")
 	err = node1.Write("k29", "v29", node2.EthAddress)
 	if err != nil {
 		fmt.Printf("!!! N1 Write k29 failed: %v\n", err)
 	}
-	time.Sleep(3 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	fmt.Println("\n---> Step 30: N2 writes k30=v30 (sends to N3) - This should trigger M:2 creation")
 	err = node2.Write("k30", "v30", node3.EthAddress)
@@ -422,7 +422,7 @@ func main() {
 	fmt.Println("Expected milestones: M0 (genesis), M:1 (after 5 writes), M:2 (after 10 writes)")
 	fmt.Println("Chrono event graph committed to Dgraph.")
 	fmt.Println("Visit http://localhost:8000 to view the graph in Ratel UI")
-	time.Sleep(3 * time.Second)
+	time.Sleep(2 * time.Second)
 }
 
 func printFinalState(id int, node *client.Client) {
