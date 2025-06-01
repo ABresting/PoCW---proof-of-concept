@@ -2,6 +2,8 @@ package client
 
 import (
 	"crypto/ecdsa"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"hash"
 	"hash/fnv"
@@ -19,6 +21,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
+	"github.com/yourorg/p2p-framework/dgraph"
 	"github.com/yourorg/p2p-framework/message"
 	"github.com/yourorg/p2p-framework/vlc"
 )
@@ -42,6 +45,29 @@ type Client struct {
 	peerEthToID map[string]uint64
 	peerIDToEth map[uint64]string
 	hasher      hash.Hash64
+
+	// Node-level event graph
+	EventGraph        *dgraph.EventGraph
+	eventMu           sync.RWMutex
+	lastMessageEvents map[string]string // Maps eventName (k:v) to its event ID
+	lastMilestone     string            // ID of the most recent milestone event
+	milestoneCreated  bool              // Flag to indicate if a milestone has been created
+
+	// Epoch coordination
+	epochMu             sync.RWMutex
+	epochNumber         int
+	epochMessageCount   int
+	epochMessageIDs     []string       // Track message IDs in current epoch
+	epochMessageDigests []string       // Track message digests for hashing
+	epochEventIDs       []string       // Track event IDs in current epoch for milestone connections
+	epochThreshold      int            // Configurable threshold for epoch finalization
+	lastEpochHash       string         // Hash of the last finalized epoch
+	receivedEpochs      map[int]string // Track received epoch finalizations
+	sentEpochs          map[int]bool   // Track epochs we've finalized and sent
+
+	// Vote tracking
+	votesMu       sync.RWMutex
+	receivedVotes map[int]map[string]string // Maps epoch_number -> voter -> signature
 }
 
 func NewClient(id uint64, address, privateKeyHex string) (*Client, error) {
@@ -67,11 +93,69 @@ func NewClient(id uint64, address, privateKeyHex string) (*Client, error) {
 		StateMu:     sync.RWMutex{},
 		replyChan:   make(chan *message.Message, 10),
 		peerEthToID: make(map[string]uint64), peerIDToEth: make(map[uint64]string),
-		hasher: fnv.New64a(),
+		hasher:              fnv.New64a(),
+		EventGraph:          dgraph.NewEventGraph(int(id), ethAddress),
+		eventMu:             sync.RWMutex{},
+		lastMessageEvents:   make(map[string]string),
+		lastMilestone:       "",
+		milestoneCreated:    false,
+		epochMu:             sync.RWMutex{},
+		epochNumber:         0,
+		epochMessageCount:   0,
+		epochMessageIDs:     make([]string, 0),
+		epochMessageDigests: make([]string, 0),
+		epochEventIDs:       make([]string, 0),
+		epochThreshold:      10,
+		lastEpochHash:       "",
+		receivedEpochs:      make(map[int]string),
+		sentEpochs:          make(map[int]bool),
+		receivedVotes:       make(map[int]map[string]string),
 	}
 	go client.handleIncomingMessages()
 	go client.handleDiscoveredPeers()
+
+	// Start auto-commit for event graph every minute
+	client.EventGraph.StartAutoCommit(5 * time.Minute)
+
+	// Create genesis milestone M0
+	client.createGenesisMilestone()
+
 	return client, nil
+}
+
+// Creates the genesis milestone M0 for the node
+func (c *Client) createGenesisMilestone() {
+	c.eventMu.Lock()
+	defer c.eventMu.Unlock()
+
+	// Define the genesis milestone key and value
+	milestoneKey := "M0"
+	milestoneValue := fmt.Sprintf("%d", c.ID)
+
+	// Add to local store
+	c.kvStoreMu.Lock()
+	c.kvStore[milestoneKey] = milestoneValue
+	c.kvStoreMu.Unlock()
+
+	// Create empty clock for genesis event
+	emptyClock := make(map[int]int)
+
+	// Add to event graph with no parents (it's the first event)
+	eventName := fmt.Sprintf("%s:%s", milestoneKey, milestoneValue)
+	eventID := c.EventGraph.AddEvent(eventName, milestoneKey, milestoneValue, emptyClock, []string{})
+
+	// Save as milestone
+	c.lastMilestone = eventID
+	c.milestoneCreated = true
+
+	// Track the latest event
+	c.lastMessageEvents[eventName] = eventID
+
+	// Store the latest event ID from this node
+	latestFromSenderKey := fmt.Sprintf("latest_from_node_%d", c.ID)
+	c.lastMessageEvents[latestFromSenderKey] = eventID
+
+	fmt.Printf("Node %d: Created genesis milestone %s with ID %s\n", c.ID, eventName, eventID)
 }
 
 func (c *Client) AddPeerMapping(ethAddr string, vlcID uint64) {
@@ -115,6 +199,9 @@ func (c *Client) Write(key, value, peerEthAddr string) error {
 		}
 		c.messageLog = append(c.messageLog, msgToSend)
 		fmt.Printf("Node %d [G:%d]: Logged write msg for key '%s'. Log size: %d\n", c.ID, goid(), key, len(c.messageLog))
+
+		// Record event for the local write
+		c.recordMessageEvent(msgToSend, "")
 	} else {
 		fmt.Printf("Node %d [G:%d]: Key '%s' already exists locally. Write aborted (no send).\n", c.ID, goid(), key)
 	}
@@ -122,6 +209,11 @@ func (c *Client) Write(key, value, peerEthAddr string) error {
 	c.ClockMu.Unlock()
 	c.kvStoreMu.Unlock()
 	if msgToSend != nil {
+		// Track this message for epoch coordination (outside of locks to avoid deadlock)
+		if !strings.HasPrefix(key, "M") { // Don't count milestones toward epoch threshold
+			c.trackMessageForEpoch(msgToSend)
+		}
+
 		fmt.Printf("Node %d [G:%d]: Sending Write message for key '%s' to %s\n", c.ID, goid(), key, peerEthAddr)
 		err := c.sendMessage("", msgToSend)
 		if err != nil {
@@ -298,7 +390,7 @@ func (c *Client) checkCanApplyDirectWrite(incomingMsg *message.Message) (
 	comparison := localClock.Compare(remoteClock)
 	if comparison == vlc.Less { // We are strictly behind, and it's not a simple +1 increment
 		fmt.Printf("Node %d [G:%d]: Apply rule: GAP_DETECTED (local < remote, not +1). Requires Sync.\n", c.ID, goid())
-		return 0, true
+		return 0, false // TODO set to false, but need to sync the k/v behind the outran state
 	}
 	// If local is Greater, Equal, or Incomparable (but not strictly Less and not +1)
 	fmt.Printf("Node %d [G:%d]: Apply rule: IGNORE/NO_ACTION (local %v vs remote %v, comp %d not meeting other criteria).\n", c.ID, goid(), localClock.Values, remoteClock.Values, comparison)
@@ -310,6 +402,7 @@ func (c *Client) handleRequest(msg *message.Message) *message.Message {
 		fmt.Printf("Node %d [G:%d]: Received invalid request (nil body or clock).\n", c.ID, goid())
 		return nil
 	}
+
 	if err := c.verifyMessageSignature(msg); err != nil {
 		fmt.Printf("Invalid req sig: %v\n", err)
 		return nil
@@ -340,48 +433,125 @@ func (c *Client) handleRequest(msg *message.Message) *message.Message {
 		value := msg.Request.Write.Value
 		remoteClock := msg.MsgClock
 
-		applyAction, requiresSync := c.checkCanApplyDirectWrite(msg)
-
-		c.ClockMu.Lock()
-		if applyAction > 0 { // applyAction 1 (first) or 2 (+one)
-
-			c.Clock.Merge([]*vlc.Clock{remoteClock})
-
-			c.Clock.Inc(c.ID)
-
-			currentClockAfterUpdateValues := c.Clock.Copy().Values // For general logging
+		// Special handling for milestone events - always apply them
+		if strings.HasPrefix(key, "M") {
+			c.ClockMu.Lock()
 			c.kvStoreMu.Lock()
-			c.logMu.Lock()
-			_, exists := c.kvStore[key]
-			if !exists || applyAction == 1 || applyAction == 2 {
+
+			// Check if we already have this milestone
+			if _, exists := c.kvStore[key]; !exists {
+				// Apply the milestone and update our clock
 				c.kvStore[key] = value
-				fmt.Printf("Node %d [G:%d]: APPLYING write key '%s' = '%s'. Action: %d. New Clock: %v\n", c.ID, goid(), key, value, applyAction, currentClockAfterUpdateValues)
-			} else {
-				fmt.Printf("Node %d [G:%d]: Key '%s' exists. Write from %s with Action %d. Clock updated. New Clock: %v. K/V not changed if not a +1 or first new.\n", c.ID, goid(), key, msg.Sender, applyAction, currentClockAfterUpdateValues)
-			}
-			foundInLog := false
-			for _, logged := range c.messageLog {
-				if logged.ReqID == msg.ReqID && logged.Sender == msg.Sender {
-					foundInLog = true
-					break
+				c.Clock.Merge([]*vlc.Clock{remoteClock})
+				c.Clock.Inc(c.ID)
+
+				fmt.Printf("Node %d [G:%d]: APPLYING milestone '%s'='%s' from %s, clock: %v\n",
+					c.ID, goid(), key, value, msg.Sender, c.Clock.Values)
+
+				// Create a dummy message to record the event for graph consistency
+				dummyMsg := &message.Message{
+					Request: &message.RequestMessage{
+						Write: &message.WriteRequest{
+							Key:   key,
+							Value: value,
+						},
+					},
+					MsgClock: c.Clock.Copy(),
+					Sender:   msg.Sender,
 				}
+
+				// Record the milestone event
+				eventID := c.recordMilestoneEvent(dummyMsg, []string{})
+
+				// Ensure this milestone is recognized as the latest milestone
+				c.eventMu.Lock()
+				c.lastMilestone = eventID
+				c.milestoneCreated = true
+				fmt.Printf("Node %d: Set milestone reference to %s for incoming milestone %s\n",
+					c.ID, eventID, key)
+				c.eventMu.Unlock()
+
+				// Reset epoch tracking when receiving a milestone from another node
+				if msg.Sender != c.EthAddress {
+					c.epochMu.Lock()
+					// Extract epoch number from milestone key (M:X format)
+					var receivedEpochNum int
+					if key != "M0" && strings.HasPrefix(key, "M:") {
+						fmt.Sscanf(key, "M:%d", &receivedEpochNum)
+						if receivedEpochNum > c.epochNumber {
+							c.epochNumber = receivedEpochNum
+							c.epochMessageCount = 0
+							c.epochMessageIDs = make([]string, 0)
+							c.epochMessageDigests = make([]string, 0)
+							c.epochEventIDs = make([]string, 0)
+							fmt.Printf("Node %d: Reset epoch tracking to %d after receiving milestone %s\n",
+								c.ID, receivedEpochNum, key)
+						}
+					}
+					c.epochMu.Unlock()
+				}
+
+				// Add a small delay to ensure the milestone is properly processed
+				time.Sleep(200 * time.Millisecond)
+			} else {
+				fmt.Printf("Node %d [G:%d]: Milestone '%s' already exists locally, skipping\n",
+					c.ID, goid(), key)
 			}
-			if !foundInLog {
-				c.messageLog = append(c.messageLog, msg)
-			}
-			c.logMu.Unlock()
+
 			c.kvStoreMu.Unlock()
-		} else if requiresSync {
-			fmt.Printf("Node %d [G:%d]: Write Req %s needs sync. Sending SyncRequest.\n", c.ID, goid(), msg.ReqID)
-			localClockCopy := c.Clock.Copy()
-			syncReqMsg := message.NewSyncRequestMessage(c.EthAddress, msg.Sender, msg.ReqID, localClockCopy, "")
-			responseToSend = syncReqMsg
+			c.ClockMu.Unlock()
 		} else {
-			fmt.Printf("Node %d [G:%d]: Ignoring Write Req %s content (e.g. local clock ahead/concurrent), but merging its clock and incrementing own.\n", c.ID, goid(), msg.ReqID)
-			c.Clock.Merge([]*vlc.Clock{remoteClock})
-			c.Clock.Inc(c.ID)
+			// Regular key-value event processing with existing logic
+			applyAction, requiresSync := c.checkCanApplyDirectWrite(msg)
+
+			c.ClockMu.Lock()
+			if applyAction > 0 {
+
+				c.Clock.Merge([]*vlc.Clock{remoteClock})
+
+				c.Clock.Inc(c.ID)
+
+				currentClockAfterUpdateValues := c.Clock.Copy().Values
+				c.kvStoreMu.Lock()
+				c.logMu.Lock()
+				_, exists := c.kvStore[key]
+				if !exists || applyAction == 1 || applyAction == 2 {
+					c.kvStore[key] = value
+					fmt.Printf("Node %d [G:%d]: APPLYING write key '%s' = '%s'. Action: %d. New Clock: %v\n", c.ID, goid(), key, value, applyAction, currentClockAfterUpdateValues)
+
+					c.recordMessageEvent(msg, "")
+				} else {
+					fmt.Printf("Node %d [G:%d]: Key '%s' exists. Write from %s with Action %d. Clock updated. New Clock: %v. K/V not changed if not a +1 or first new.\n", c.ID, goid(), key, msg.Sender, applyAction, currentClockAfterUpdateValues)
+				}
+				foundInLog := false
+				for _, logged := range c.messageLog {
+					if logged.ReqID == msg.ReqID && logged.Sender == msg.Sender {
+						foundInLog = true
+						break
+					}
+				}
+				if !foundInLog {
+					c.messageLog = append(c.messageLog, msg)
+				}
+				c.logMu.Unlock()
+				c.kvStoreMu.Unlock()
+
+				// Track this message for epoch coordination (outside of locks to avoid deadlock)
+				if !strings.HasPrefix(key, "M") && (!exists || applyAction == 1 || applyAction == 2) {
+					c.trackMessageForEpoch(msg)
+				}
+			} else if requiresSync {
+				fmt.Printf("Node %d [G:%d]: Write Req %s needs sync. Sending SyncRequest.\n", c.ID, goid(), msg.ReqID)
+				localClockCopy := c.Clock.Copy()
+				syncReqMsg := message.NewSyncRequestMessage(c.EthAddress, msg.Sender, msg.ReqID, localClockCopy, "")
+				responseToSend = syncReqMsg
+			} else {
+				fmt.Printf("Node %d [G:%d]: Ignoring Write Req %s content (e.g. local clock ahead/concurrent), but merging its clock and incrementing own.\n", c.ID, goid(), msg.ReqID)
+				c.Clock.Merge([]*vlc.Clock{remoteClock})
+				c.Clock.Inc(c.ID)
+			}
+			c.ClockMu.Unlock()
 		}
-		c.ClockMu.Unlock()
 	}
 	if responseToSend != nil {
 		if err := c.signMessage(responseToSend); err != nil {
@@ -402,7 +572,6 @@ func (c *Client) handleSyncRequest(msg *message.Message) *message.Message {
 		return nil
 	}
 	requesterClock := msg.SyncRequest.RequesterClock
-	// fmt.Printf("Node %d [G:%d]: Handling SyncRequest from %s (ReqID: %s) who has clock %v\n", c.ID, goid(), msg.Sender, msg.ReqID, requesterClock.Values) // Can be verbose
 	c.ClockMu.Lock()
 	c.Clock.Merge([]*vlc.Clock{requesterClock})
 	c.Clock.Inc(c.ID)
@@ -429,12 +598,11 @@ func (c *Client) handleSyncRequest(msg *message.Message) *message.Message {
 		})
 		syncRespMsg := message.NewSyncResponseMessage(c.EthAddress, msg.Sender, msg.ReqID, missingMessages, localClockCopyForResponse, "")
 		if err := c.signMessage(syncRespMsg); err != nil {
-			fmt.Printf("Node %d [G:%d]: Failed to sign SyncResponse: %v\n", c.ID, goid(), err)
+			fmt.Printf("Node %d: Failed to sign SyncResponse: %v\n", c.ID, err)
 			return nil
 		}
 		return syncRespMsg
 	}
-	// fmt.Printf("Node %d [G:%d]: No missing messages for %s. No SyncResponse sent.\n", c.ID, goid(), msg.Sender) // Can be verbose
 	return nil
 }
 
@@ -448,12 +616,10 @@ func (c *Client) handleSyncResponse(msg *message.Message) {
 		return
 	}
 	missingMessages := msg.SyncResponse.MissingMessages
-	// fmt.Printf("Node %d [G:%d]: Handling SyncResponse from %s with %d msgs. Sender's Clock %v\n", c.ID, goid(), msg.Sender, len(missingMessages), msg.MsgClock.Values) // Can be verbose
 	c.ClockMu.Lock()
 	c.Clock.Merge([]*vlc.Clock{msg.MsgClock})
-	c.Clock.Inc(c.ID) /* initialMergedClockValues := c.Clock.Copy().Values; */
+	c.Clock.Inc(c.ID)
 	c.ClockMu.Unlock()
-	// fmt.Printf("Node %d [G:%d]: Clock after merging SyncResponse outer clock & inc: %v\n", c.ID, goid(), initialMergedClockValues) // Can be verbose
 	processedCount := 0
 	sort.SliceStable(missingMessages, func(i, j int) bool {
 		return missingMessages[i].MsgClock.Compare(missingMessages[j].MsgClock) == vlc.Less
@@ -478,6 +644,8 @@ func (c *Client) handleSyncResponse(msg *message.Message) {
 			c.Clock.Inc(c.ID)
 			appliedThisMessage = true
 			fmt.Printf("Node %d [G:%d]: APPLYING synced message for new key '%s'.\n", c.ID, goid(), key)
+
+			c.recordMessageEvent(msgToApply, "")
 		} else if (keyExistsLocally || !keyExistsLocally) && (comparisonWithMsgSpecificClock == vlc.Less || comparisonWithMsgSpecificClock == vlc.Incomparable) {
 			c.Clock.Merge([]*vlc.Clock{messageSpecificClock})
 			c.Clock.Inc(c.ID)
@@ -505,32 +673,38 @@ func (c *Client) handleSyncResponse(msg *message.Message) {
 		c.ClockMu.Unlock()
 	}
 	c.logMu.Lock()
-	sort.SliceStable(c.messageLog, func(i, j int) bool { return c.messageLog[i].MsgClock.Compare(missingMessages[j].MsgClock) == vlc.Less })
+	if len(c.messageLog) > 1 {
+		sort.SliceStable(c.messageLog, func(i, j int) bool {
+			return c.messageLog[i].MsgClock.Compare(c.messageLog[j].MsgClock) == vlc.Less
+		})
+	}
 	c.logMu.Unlock()
-	c.ClockMu.RLock()
-	finalClockVal := c.Clock.Values
-	c.ClockMu.RUnlock()
-	c.logMu.RLock()
-	finalLogSize := len(c.messageLog)
-	c.logMu.RUnlock()
-	fmt.Printf("Node %d [G:%d]: Finished SyncResponse. Processed %d updates. Final Clock: %v. Log size: %d\n", c.ID, goid(), processedCount, finalClockVal, finalLogSize)
+
+	fmt.Printf("Node %d: Finished SyncResponse. Processed %d updates.\n", c.ID, processedCount)
 }
 
 func (c *Client) handleMessage(msg *message.Message) *message.Message {
 	if msg == nil {
 		return nil
 	}
-	// clockStr := "nil"; if msg.MsgClock != nil { clockStr = fmt.Sprintf("%v", msg.MsgClock.Values) } // Can be verbose
-	// fmt.Printf("Node %d [G:%d]: Received message Type=%s from %s ReqID=%s Clock=%s\n", c.ID, goid(), msg.Type, msg.Sender, msg.ReqID, clockStr) // Can be verbose
+
 	var response *message.Message
 	switch msg.Type {
 	case message.TypeP2P:
 		if msg.P2P != nil && msg.MsgClock != nil {
 			if err := c.verifyMessageSignature(msg); err == nil {
-				c.ClockMu.Lock()
-				c.Clock.Merge([]*vlc.Clock{msg.MsgClock})
-				c.Clock.Inc(c.ID)
-				c.ClockMu.Unlock()
+				// Don't update clocks for consensus messages
+				if msg.P2P.Data != "" && strings.Contains(msg.P2P.Data, "epoch_finalize") {
+					c.handleEpochFinalization(msg)
+				} else if msg.P2P.Data != "" && strings.Contains(msg.P2P.Data, "epoch_vote") {
+					c.handleEpochVote(msg)
+				} else {
+					c.ClockMu.Lock()
+					c.Clock.Merge([]*vlc.Clock{msg.MsgClock})
+					c.Clock.Inc(c.ID)
+					c.ClockMu.Unlock()
+					fmt.Printf("Node %d: Unhandled P2P message type: %s\n", c.ID, msg.P2P.Data)
+				}
 			} else {
 				fmt.Printf("Invalid P2P sig: %v\n", err)
 			}
@@ -557,6 +731,305 @@ func (c *Client) handleMessage(msg *message.Message) *message.Message {
 		fmt.Printf("Node %d [G:%d]: Unknown message type '%s'\n", c.ID, goid(), msg.Type)
 	}
 	return response
+}
+
+// handleEpochFinalization processes an incoming epoch finalization message
+func (c *Client) handleEpochFinalization(msg *message.Message) {
+	if msg == nil || msg.P2P == nil {
+		return
+	}
+
+	content := msg.P2P.Data
+
+	if content == "" {
+		return
+	}
+
+	var epochNumber int
+	var epochHash string
+	var sender string
+	var messageCount int
+
+	if numField := strings.Index(content, "epoch_number:"); numField > 0 {
+		numStr := content[numField+13:]
+		numEnd := strings.Index(numStr, " ")
+		if numEnd > 0 {
+			epochNumber, _ = strconv.Atoi(numStr[:numEnd])
+		}
+	}
+
+	if hashField := strings.Index(content, "epoch_hash:"); hashField > 0 {
+		hashStr := content[hashField+11:]
+		hashEnd := strings.Index(hashStr, " ")
+		if hashEnd > 0 {
+			epochHash = hashStr[:hashEnd]
+		}
+	}
+
+	if senderField := strings.Index(content, "sender:"); senderField > 0 {
+		senderStr := content[senderField+7:]
+		senderEnd := strings.Index(senderStr, " ")
+		if senderEnd > 0 {
+			sender = senderStr[:senderEnd]
+		}
+	}
+
+	if countField := strings.Index(content, "message_count:"); countField > 0 {
+		countStr := content[countField+14:]
+		countEnd := strings.Index(countStr, " ")
+		if countEnd > 0 {
+			messageCount, _ = strconv.Atoi(countStr[:countEnd])
+		} else {
+			countEnd = strings.Index(countStr, "]")
+			if countEnd > 0 {
+				messageCount, _ = strconv.Atoi(countStr[:countEnd])
+			}
+		}
+	}
+
+	if epochNumber == 0 || epochHash == "" {
+		fmt.Printf("Node %d: Received malformed epoch finalization: %s\n", c.ID, content)
+		return
+	}
+
+	c.epochMu.Lock()
+	defer c.epochMu.Unlock()
+
+	if _, exists := c.receivedEpochs[epochNumber]; !exists {
+		c.receivedEpochs[epochNumber] = epochHash
+
+		if epochNumber > c.epochNumber {
+			c.epochNumber = epochNumber
+		}
+
+		fmt.Printf("Node %d: RECEIVED EPOCH %d from %s with %d messages, hash: %s\n",
+			c.ID, epochNumber, sender, messageCount, epochHash)
+
+		if sender != "" && sender != c.EthAddress {
+			go c.sendEpochVote(epochNumber, epochHash, sender)
+		}
+	}
+}
+
+// sendEpochVote creates and sends a vote for an epoch finalization
+func (c *Client) sendEpochVote(epochNumber int, epochHash string, recipient string) {
+	hashBytes := crypto.Keccak256([]byte(epochHash))
+	signature, err := crypto.Sign(hashBytes, c.PrivateKey)
+	if err != nil {
+		fmt.Printf("Node %d: Failed to sign epoch vote: %v\n", c.ID, err)
+		return
+	}
+	signatureHex := hexutil.Encode(signature)
+
+	voteMsg := map[string]interface{}{
+		"type":         "epoch_vote",
+		"epoch_number": epochNumber,
+		"signature":    signatureHex,
+		"voter":        c.EthAddress,
+	}
+	voteMsgStr := fmt.Sprintf("%v", voteMsg)
+	reqID := uuid.New().String()
+
+	// For consensus messages, use an empty vector clock instead of the current clock
+	// This way they don't affect causal ordering
+	emptyClockForConsensus := vlc.New()
+	msg := message.NewP2PMessage(c.EthAddress, recipient, reqID, voteMsgStr, "", emptyClockForConsensus)
+
+	// Sign and send the vote
+	if err := c.signMessage(msg); err != nil {
+		fmt.Printf("Node %d: Failed to sign vote message: %v\n", c.ID, err)
+		return
+	}
+
+	if err := c.sendMessage("", msg); err != nil {
+		fmt.Printf("Node %d: Failed to send vote for epoch %d to %s: %v\n",
+			c.ID, epochNumber, recipient, err)
+	} else {
+		fmt.Printf("Node %d: Sent VOTE for epoch %d to %s\n", c.ID, epochNumber, recipient)
+	}
+}
+
+// handleEpochVote processes a received vote for an epoch
+func (c *Client) handleEpochVote(msg *message.Message) {
+	if msg == nil || msg.P2P == nil || msg.P2P.Data == "" {
+		return
+	}
+
+	content := msg.P2P.Data
+	var epochNumber int
+	var signature string
+	var voter string
+
+	extractField := func(fieldName string, content string) string {
+		patterns := []string{
+			fmt.Sprintf("%s:", fieldName),
+			fmt.Sprintf("%s ", fieldName),
+			fmt.Sprintf("[\"%s\"]:", fieldName),
+			fmt.Sprintf("[%s]:", fieldName),
+			fmt.Sprintf("map[%s:", fieldName),
+			fmt.Sprintf("map[\"%s\":", fieldName),
+		}
+
+		for _, pattern := range patterns {
+			if idx := strings.Index(content, pattern); idx >= 0 {
+				afterPattern := content[idx+len(pattern):]
+				valueEnd := -1
+				for _, possibleEnd := range []string{" ", ",", "}", "]", "map"} {
+					if end := strings.Index(afterPattern, possibleEnd); end > 0 {
+						if valueEnd == -1 || end < valueEnd {
+							valueEnd = end
+						}
+					}
+				}
+
+				if valueEnd > 0 {
+					value := strings.TrimSpace(afterPattern[:valueEnd])
+					return strings.Trim(value, "\"'")
+				} else {
+					return strings.TrimSpace(afterPattern)
+				}
+			}
+		}
+		return ""
+	}
+
+	epochStr := extractField("epoch_number", content)
+	signature = extractField("signature", content)
+	voter = extractField("voter", content)
+
+	if epochStr != "" {
+		epochNumber, _ = strconv.Atoi(epochStr)
+	}
+
+	if epochNumber == 0 || signature == "" || voter == "" {
+		fmt.Printf("Node %d: Received malformed epoch vote\n", c.ID)
+		return
+	}
+
+	c.epochMu.RLock()
+	epochHash, exists := c.receivedEpochs[epochNumber]
+	wasSentByUs := c.sentEpochs[epochNumber]
+	c.epochMu.RUnlock()
+
+	if !exists {
+		fmt.Printf("Node %d: Received vote for unknown epoch %d from %s\n", c.ID, epochNumber, voter)
+		return
+	}
+
+	signatureBytes, err := hexutil.Decode(signature)
+	if err != nil {
+		fmt.Printf("Node %d: Invalid signature format in vote\n", c.ID)
+		return
+	}
+
+	messageHash := crypto.Keccak256([]byte(epochHash))
+	pubKey, err := crypto.SigToPub(messageHash, signatureBytes)
+	if err != nil {
+		fmt.Printf("Node %d: Failed to recover public key from signature\n", c.ID)
+		return
+	}
+
+	recoveredAddress := crypto.PubkeyToAddress(*pubKey).Hex()
+	if !strings.EqualFold(recoveredAddress, voter) {
+		fmt.Printf("Node %d: Signature verification failed\n", c.ID)
+		return
+	}
+
+	fmt.Printf("Node %d: RECEIVED VALID VOTE for epoch %d from %s\n", c.ID, epochNumber, voter)
+
+	if wasSentByUs {
+		c.votesMu.Lock()
+
+		if _, ok := c.receivedVotes[epochNumber]; !ok {
+			c.receivedVotes[epochNumber] = make(map[string]string)
+		}
+
+		c.receivedVotes[epochNumber][voter] = signature
+
+		allVoted := true
+		for peerAddr := range c.Peers {
+			if peerAddr == c.EthAddress {
+				continue // Skip self
+			}
+
+			if _, hasVoted := c.receivedVotes[epochNumber][peerAddr]; !hasVoted {
+				allVoted = false
+				break
+			}
+		}
+
+		c.votesMu.Unlock()
+
+		if allVoted {
+			fmt.Printf("Node %d: Received all votes for epoch %d - Creating milestone\n", c.ID, epochNumber)
+
+			milestoneKey := fmt.Sprintf("M:%d", epochNumber)
+			milestoneValue := fmt.Sprintf("%d", c.ID)
+
+			c.kvStoreMu.Lock()
+			c.ClockMu.Lock()
+
+			if _, exists := c.kvStore[milestoneKey]; !exists {
+				c.kvStore[milestoneKey] = milestoneValue
+				c.Clock.Inc(c.ID)
+
+				fmt.Printf("Node %d: Created local milestone %s:%s\n",
+					c.ID, milestoneKey, milestoneValue)
+
+				dummyMsg := &message.Message{
+					Request: &message.RequestMessage{
+						Write: &message.WriteRequest{
+							Key:   milestoneKey,
+							Value: milestoneValue,
+						},
+					},
+					MsgClock: c.Clock.Copy(),
+					Sender:   c.EthAddress,
+				}
+
+				c.recordMessageEvent(dummyMsg, "")
+
+				// Add a small delay to ensure the milestone is properly recorded
+				// before any subsequent messages are processed
+				time.Sleep(200 * time.Millisecond)
+			}
+
+			c.ClockMu.Unlock()
+			c.kvStoreMu.Unlock()
+
+			// Then broadcast to all peers using direct message sending rather than Write
+			for peerEthAddr := range c.Peers {
+				if peerEthAddr == c.EthAddress {
+					continue
+				}
+
+				c.ClockMu.RLock()
+				clockCopy := c.Clock.Copy()
+				c.ClockMu.RUnlock()
+
+				reqID := uuid.New().String()
+				requestPayload := &message.RequestMessage{
+					Write: &message.WriteRequest{
+						Key:   milestoneKey,
+						Value: milestoneValue,
+					},
+				}
+
+				msgToSend := message.NewRequestMessage(c.EthAddress, peerEthAddr, reqID, requestPayload, clockCopy, "")
+
+				if err := c.signMessage(msgToSend); err != nil {
+					fmt.Printf("Node %d: Failed to sign milestone message: %v\n", c.ID, err)
+					continue
+				}
+
+				if err := c.sendMessage("", msgToSend); err != nil {
+					fmt.Printf("Node %d: Failed to send milestone to %s: %v\n", c.ID, peerEthAddr, err)
+				} else {
+					fmt.Printf("Node %d: Broadcast milestone M:%d to %s\n", c.ID, epochNumber, peerEthAddr)
+				}
+			}
+		}
+	}
 }
 
 func (c *Client) handleIncomingMessages() {
@@ -649,4 +1122,621 @@ func goid() int {
 	idField := strings.Fields(strings.TrimPrefix(string(buf[:n]), "goroutine "))[0]
 	id, _ := strconv.Atoi(idField)
 	return id
+}
+
+// recordMilestoneEvent specifically handles milestone events with preserved epoch events
+func (c *Client) recordMilestoneEvent(msg *message.Message, epochEvents []string) string {
+	if msg == nil || msg.Request == nil || msg.Request.Write == nil {
+		return ""
+	}
+
+	c.eventMu.Lock()
+	defer c.eventMu.Unlock()
+
+	key := msg.Request.Write.Key
+	value := msg.Request.Write.Value
+
+	if key == "" {
+		return ""
+	}
+
+	eventName := fmt.Sprintf("%s:%s", key, value)
+
+	// Return existing event if we've seen this key-value pair before
+	if existingID, exists := c.lastMessageEvents[eventName]; exists {
+		return existingID
+	}
+
+	// Convert vector clock format
+	milestoneClock := make(map[int]int)
+	if msg.MsgClock != nil {
+		for k, v := range msg.MsgClock.Values {
+			milestoneClock[int(k)] = int(v)
+		}
+	}
+
+	parentIDs := make([]string, 0)
+
+	// CORRECTED LOGIC: Only connect to events from the current epoch
+	if len(epochEvents) > 0 {
+		// Use the provided epoch events - these are exactly the events from this epoch
+		parentIDs = append(parentIDs, epochEvents...)
+		fmt.Printf("Node %d: Milestone %s connecting to epoch events: %v\n",
+			c.ID, eventName, epochEvents)
+	} else {
+		// For received milestones, find events that occurred after the previous milestone
+		// but before this milestone (i.e., events from this epoch only)
+
+		var milestoneNum int
+		if strings.HasPrefix(key, "M:") {
+			fmt.Sscanf(key, "M:%d", &milestoneNum)
+		}
+
+		// Find the previous milestone
+		var previousMilestoneID string
+		if milestoneNum > 1 {
+			// Look for M:(milestoneNum-1) milestone
+			prevMilestoneKey := fmt.Sprintf("M:%d", milestoneNum-1)
+			for storedName, eventID := range c.lastMessageEvents {
+				if strings.HasPrefix(storedName, prevMilestoneKey+":") {
+					previousMilestoneID = eventID
+					break
+				}
+			}
+		} else {
+			// For M:1, the previous milestone is M0
+			for storedName, eventID := range c.lastMessageEvents {
+				if strings.HasPrefix(storedName, "M0:") {
+					previousMilestoneID = eventID
+					break
+				}
+			}
+		}
+
+		if previousMilestoneID != "" {
+			// Get the previous milestone's vector clock
+			prevClockKey := fmt.Sprintf("clock_%s", previousMilestoneID)
+			var prevMilestoneClock map[int]int
+			if clockStr, exists := c.lastMessageEvents[prevClockKey]; exists {
+				prevMilestoneClock = c.parseClockString(clockStr)
+			}
+
+			// Find all non-milestone events that occurred after the previous milestone
+			// but before this milestone (epoch events)
+			for storedName, eventID := range c.lastMessageEvents {
+				// Skip milestone events, timestamp entries, clock entries
+				if strings.HasPrefix(storedName, "M") ||
+					strings.HasPrefix(storedName, "timestamp_") ||
+					strings.HasPrefix(storedName, "clock_") ||
+					strings.HasPrefix(storedName, "latest_from_node_") {
+					continue
+				}
+
+				// Get the event's vector clock
+				clockKey := fmt.Sprintf("clock_%s", eventID)
+				if clockStr, exists := c.lastMessageEvents[clockKey]; exists {
+					eventClock := c.parseClockString(clockStr)
+
+					// Check if this event occurred after the previous milestone
+					// and before/at the current milestone
+					occurredAfterPrev := true
+					occurredBeforeCurrent := true
+
+					// Compare with previous milestone clock
+					if prevMilestoneClock != nil {
+						for nodeID, prevTime := range prevMilestoneClock {
+							if eventTime, exists := eventClock[nodeID]; exists {
+								if eventTime < prevTime {
+									occurredAfterPrev = false
+									break
+								}
+							}
+						}
+					}
+
+					// Compare with current milestone clock
+					for nodeID, eventTime := range eventClock {
+						if milestoneTime, exists := milestoneClock[nodeID]; exists {
+							if eventTime > milestoneTime {
+								occurredBeforeCurrent = false
+								break
+							}
+						}
+					}
+
+					// If event occurred after previous milestone and before current milestone,
+					// it's part of this epoch
+					if occurredAfterPrev && occurredBeforeCurrent {
+						parentIDs = append(parentIDs, eventID)
+					}
+				}
+			}
+
+			fmt.Printf("Node %d: Received milestone %s connecting to epoch events (after prev milestone): %v\n",
+				c.ID, eventName, parentIDs)
+		} else {
+			// Fallback: connect to the most recent milestone if no epoch events found
+			for storedName, eventID := range c.lastMessageEvents {
+				if strings.HasPrefix(storedName, "M:") || strings.HasPrefix(storedName, "M0:") {
+					parentIDs = append(parentIDs, eventID)
+					fmt.Printf("Node %d: Received milestone %s connected to previous milestone (fallback)\n",
+						c.ID, eventName)
+					break
+				}
+			}
+		}
+	}
+
+	fmt.Printf("Node %d: Creating milestone %s with parents (epoch events only): %v\n",
+		c.ID, eventName, parentIDs)
+
+	// Add the event to the graph
+	eventID := c.EventGraph.AddEvent(eventName, key, value, milestoneClock, parentIDs)
+
+	// Track this event for future reference
+	c.lastMessageEvents[eventName] = eventID
+
+	// Store vector clock for the event for causality checking
+	clockKey := fmt.Sprintf("clock_%s", eventID)
+	clockStr := fmt.Sprintf("%v", milestoneClock)
+	c.lastMessageEvents[clockKey] = clockStr
+
+	// Update milestone tracking
+	c.lastMilestone = eventID
+	c.milestoneCreated = true
+
+	return eventID
+}
+
+// Records an event in the graph when a key-value pair is written
+func (c *Client) recordMessageEvent(msg *message.Message, _ string) string {
+	if msg == nil || msg.Request == nil || msg.Request.Write == nil {
+		return ""
+	}
+
+	c.eventMu.Lock()
+	defer c.eventMu.Unlock()
+
+	key := msg.Request.Write.Key
+	value := msg.Request.Write.Value
+
+	if key == "" {
+		return ""
+	}
+
+	eventName := fmt.Sprintf("%s:%s", key, value)
+
+	// Return existing event if we've seen this key-value pair before
+	if existingID, exists := c.lastMessageEvents[eventName]; exists {
+		return existingID
+	}
+
+	parentIDs := make([]string, 0)
+
+	// Determine the sender ID
+	senderID := int(c.ID)
+	if msg.Sender != c.EthAddress {
+		if vlcID, exists := c.peerEthToID[msg.Sender]; exists {
+			senderID = int(vlcID)
+		}
+	}
+
+	// Handle milestone events (M:X:Y format) - these should use recordMilestoneEvent instead
+	if strings.HasPrefix(key, "M") && key != "M0" {
+		// For milestones created during epoch finalization, this should not be called
+		// Instead, recordMilestoneEvent should be called with the preserved epoch events
+		// This is a fallback for milestones received from other nodes
+
+		// Connect to the most recent milestone as fallback
+		for storedName, eventID := range c.lastMessageEvents {
+			if strings.HasPrefix(storedName, "M:") || strings.HasPrefix(storedName, "M0:") {
+				parentIDs = append(parentIDs, eventID)
+				fmt.Printf("Node %d: Received milestone %s connected to previous milestone (fallback)\n",
+					c.ID, eventName)
+				break
+			}
+		}
+
+		// If no milestone found, connect to genesis
+		if len(parentIDs) == 0 {
+			for storedName, eventID := range c.lastMessageEvents {
+				if strings.HasPrefix(storedName, "M0:") {
+					parentIDs = append(parentIDs, eventID)
+					fmt.Printf("Node %d: Received milestone %s connected to genesis M0 (fallback)\n",
+						c.ID, eventName)
+					break
+				}
+			}
+		}
+	} else {
+		// Handle regular key-value events
+		// Strategy: Use vector clock causality to find immediate causal predecessors
+
+		// Get the current event's vector clock
+		currentClock := make(map[int]int)
+		if msg.MsgClock != nil {
+			for k, v := range msg.MsgClock.Values {
+				currentClock[int(k)] = int(v)
+			}
+		}
+
+		// Find immediate causal predecessors based on vector clock relationships
+		var causalPredecessors []string
+
+		// Check all existing events to see which ones are immediate causal predecessors
+		for storedName, eventID := range c.lastMessageEvents {
+			// Skip milestone events, timestamp entries, clock entries, and latest_from_node entries
+			if strings.HasPrefix(storedName, "M") ||
+				strings.HasPrefix(storedName, "timestamp_") ||
+				strings.HasPrefix(storedName, "clock_") ||
+				strings.HasPrefix(storedName, "latest_from_node_") {
+				continue
+			}
+
+			// Get the stored event's vector clock
+			clockKey := fmt.Sprintf("clock_%s", eventID)
+			if clockStr, exists := c.lastMessageEvents[clockKey]; exists {
+				storedClock := c.parseClockString(clockStr)
+
+				// Check if this stored event is an immediate causal predecessor
+				if c.isImmediateCausalPredecessor(storedClock, currentClock) {
+					causalPredecessors = append(causalPredecessors, eventID)
+				}
+			}
+		}
+
+		// If we found causal predecessors, use them
+		if len(causalPredecessors) > 0 {
+			parentIDs = append(parentIDs, causalPredecessors...)
+			fmt.Printf("Node %d: Key-value event %s connected to causal predecessors: %v\n",
+				c.ID, eventName, causalPredecessors)
+		} else {
+			// No causal predecessors found, connect to the most appropriate milestone
+			// Find the causally latest milestone using vector clocks, not timestamps
+			mostRecentMilestone := ""
+			mostRecentMilestoneClock := make(map[int]int)
+
+			for storedName, eventID := range c.lastMessageEvents {
+				if strings.HasPrefix(storedName, "M:") {
+					// Get the milestone's vector clock
+					clockKey := fmt.Sprintf("clock_%s", eventID)
+					if clockStr, exists := c.lastMessageEvents[clockKey]; exists {
+						milestoneClock := c.parseClockString(clockStr)
+
+						// If this is the first milestone we're checking, use it as baseline
+						if mostRecentMilestone == "" {
+							mostRecentMilestone = eventID
+							mostRecentMilestoneClock = milestoneClock
+						} else {
+							// Compare vector clocks to find the causally latest milestone
+							isLater := true
+							isEarlier := true
+
+							// Check all nodes in both clocks
+							allNodes := make(map[int]bool)
+							for k := range milestoneClock {
+								allNodes[k] = true
+							}
+							for k := range mostRecentMilestoneClock {
+								allNodes[k] = true
+							}
+
+							for nodeID := range allNodes {
+								milestoneValue := milestoneClock[nodeID]               // defaults to 0 if not present
+								currentLatestValue := mostRecentMilestoneClock[nodeID] // defaults to 0 if not present
+
+								if milestoneValue < currentLatestValue {
+									isLater = false
+								}
+								if milestoneValue > currentLatestValue {
+									isEarlier = false
+								}
+							}
+
+							// If this milestone is causally later, use it
+							if isLater && !isEarlier {
+								mostRecentMilestone = eventID
+								mostRecentMilestoneClock = milestoneClock
+							}
+						}
+					}
+				}
+			}
+
+			if mostRecentMilestone != "" {
+				parentIDs = append(parentIDs, mostRecentMilestone)
+				fmt.Printf("Node %d: Key-value event %s connected to causally latest milestone ID %s (clock: %v)\n",
+					c.ID, eventName, mostRecentMilestone, mostRecentMilestoneClock)
+			} else {
+				// Connect to genesis milestone (M0)
+				for storedName, eventID := range c.lastMessageEvents {
+					if strings.HasPrefix(storedName, "M0:") {
+						parentIDs = append(parentIDs, eventID)
+						fmt.Printf("Node %d: Key-value event %s connected to genesis M0 ID %s (no milestones)\n",
+							c.ID, eventName, eventID)
+						break
+					}
+				}
+			}
+		}
+	}
+
+	// Final fallback - connect to genesis milestone (M0) if no parents found
+	if len(parentIDs) == 0 && key != "M0" {
+		for storedName, eventID := range c.lastMessageEvents {
+			if strings.HasPrefix(storedName, "M0:") {
+				parentIDs = append(parentIDs, eventID)
+				break
+			}
+		}
+	}
+
+	// Convert vector clock format
+	clock := make(map[int]int)
+	if msg.MsgClock != nil {
+		for k, v := range msg.MsgClock.Values {
+			clock[int(k)] = int(v)
+		}
+	}
+
+	// Add the event to the graph
+	fmt.Printf("Node %d: Creating CHRONO event %s with parents: %v\n", c.ID, eventName, parentIDs)
+	eventID := c.EventGraph.AddEvent(eventName, key, value, clock, parentIDs)
+
+	// Track this event for future reference
+	c.lastMessageEvents[eventName] = eventID
+
+	// Update latest event pointer for this sender
+	latestFromSenderKey := fmt.Sprintf("latest_from_node_%d", senderID)
+	c.lastMessageEvents[latestFromSenderKey] = eventID
+
+	// Store vector clock for the event for causality checking
+	clockKey := fmt.Sprintf("clock_%s", eventID)
+	clockStr := fmt.Sprintf("%v", clock)
+	c.lastMessageEvents[clockKey] = clockStr
+
+	// Update milestone tracking if needed
+	if strings.HasPrefix(key, "M") {
+		c.lastMilestone = eventID
+		c.milestoneCreated = true
+	} else {
+		// Track ALL non-milestone events in the current epoch (both local and received)
+		c.epochMu.Lock()
+		c.epochEventIDs = append(c.epochEventIDs, eventID)
+		c.epochMu.Unlock()
+		fmt.Printf("Node %d: Added event %s (ID: %s) to current epoch tracking\n", c.ID, eventName, eventID)
+	}
+
+	return eventID
+}
+
+// SetEpochThreshold sets the number of messages required to trigger an epoch finalization
+func (c *Client) SetEpochThreshold(threshold int) {
+	if threshold <= 0 {
+		return
+	}
+	c.epochMu.Lock()
+	c.epochThreshold = threshold
+	c.epochMu.Unlock()
+	fmt.Printf("Node %d: Set epoch threshold to %d messages\n", c.ID, threshold)
+}
+
+// trackMessageForEpoch adds a message to the current epoch tracking and checks if an epoch should be finalized
+func (c *Client) trackMessageForEpoch(msg *message.Message) {
+	if msg == nil || msg.ReqID == "" {
+		return
+	}
+
+	if msg.Type == message.TypeP2P && msg.P2P != nil && msg.P2P.Data != "" {
+		if strings.Contains(msg.P2P.Data, "epoch_finalize") ||
+			strings.Contains(msg.P2P.Data, "epoch_vote") {
+			return
+		}
+	}
+
+	isWrite := msg.Type == message.TypeRequest && msg.Request != nil && msg.Request.Write != nil
+
+	var shouldFinalize bool
+
+	c.epochMu.Lock()
+	digest := fmt.Sprintf("%s:%s:%s", msg.ReqID, msg.Sender, msg.Type)
+
+	c.epochMessageIDs = append(c.epochMessageIDs, msg.ReqID)
+	c.epochMessageDigests = append(c.epochMessageDigests, digest)
+
+	if isWrite {
+		c.epochMessageCount++
+		fmt.Printf("Node %d: Epoch message count now %d/%d (after processing write)\n",
+			c.ID, c.epochMessageCount, c.epochThreshold)
+
+		// Check if we've reached the threshold
+		if c.epochMessageCount >= c.epochThreshold {
+			fmt.Printf("Node %d: Reached threshold of %d write messages - will finalize epoch\n",
+				c.ID, c.epochThreshold)
+			shouldFinalize = true
+		}
+	}
+	c.epochMu.Unlock()
+
+	// Call finalizeEpoch outside of the lock to avoid deadlock
+	if shouldFinalize {
+		c.finalizeEpoch()
+	}
+}
+
+// finalizeEpoch creates and broadcasts a milestone event when epoch threshold is reached
+func (c *Client) finalizeEpoch() {
+	c.epochMu.Lock()
+
+	// Calculate hash of all messages in this epoch
+	hasher := sha256.New()
+
+	// Sort digests for consistent hashing regardless of message order
+	sort.Strings(c.epochMessageDigests)
+
+	// Add the last epoch hash for chaining epochs
+	if c.lastEpochHash != "" {
+		hasher.Write([]byte(c.lastEpochHash))
+	}
+
+	// Add all message digests
+	for _, digest := range c.epochMessageDigests {
+		hasher.Write([]byte(digest))
+	}
+
+	epochHash := hex.EncodeToString(hasher.Sum(nil))
+	currentEpochNumber := c.epochNumber + 1
+
+	// Create the milestone key and value
+	milestoneKey := fmt.Sprintf("M:%d", currentEpochNumber)
+	milestoneValue := fmt.Sprintf("%d", c.ID)
+
+	// PRESERVE the current epoch events for milestone connection
+	epochEventsForMilestone := make([]string, len(c.epochEventIDs))
+	copy(epochEventsForMilestone, c.epochEventIDs)
+
+	fmt.Printf("Node %d: FINALIZING EPOCH %d with %d messages, creating milestone %s\n",
+		c.ID, currentEpochNumber, c.epochMessageCount, milestoneKey)
+	fmt.Printf("Node %d: Milestone %s will connect to epoch events: %v\n",
+		c.ID, milestoneKey, epochEventsForMilestone)
+
+	// Reset for next epoch BEFORE releasing the lock
+	c.epochNumber = currentEpochNumber
+	c.epochMessageCount = 0
+	c.epochMessageIDs = make([]string, 0)
+	c.epochMessageDigests = make([]string, 0)
+	c.epochEventIDs = make([]string, 0)
+	c.lastEpochHash = epochHash
+
+	c.epochMu.Unlock()
+
+	// Create and store the milestone locally first
+	c.kvStoreMu.Lock()
+	c.ClockMu.Lock()
+
+	if _, exists := c.kvStore[milestoneKey]; !exists {
+		c.kvStore[milestoneKey] = milestoneValue
+		c.Clock.Inc(c.ID)
+
+		// Create a message for the milestone event
+		clockCopy := c.Clock.Copy()
+
+		dummyMsg := &message.Message{
+			Request: &message.RequestMessage{
+				Write: &message.WriteRequest{
+					Key:   milestoneKey,
+					Value: milestoneValue,
+				},
+			},
+			MsgClock: clockCopy,
+			Sender:   c.EthAddress,
+		}
+
+		// Record the milestone event in the graph with the preserved epoch events
+		c.recordMilestoneEvent(dummyMsg, epochEventsForMilestone)
+
+		fmt.Printf("Node %d: Created local milestone %s:%s\n", c.ID, milestoneKey, milestoneValue)
+	}
+
+	c.ClockMu.Unlock()
+	c.kvStoreMu.Unlock()
+
+	// Now broadcast the milestone to all peers using Write messages
+	for peerEthAddr := range c.Peers {
+		if peerEthAddr == c.EthAddress {
+			continue
+		}
+
+		// Get current clock for the message
+		c.ClockMu.RLock()
+		clockCopy := c.Clock.Copy()
+		c.ClockMu.RUnlock()
+
+		reqID := uuid.New().String()
+		requestPayload := &message.RequestMessage{
+			Write: &message.WriteRequest{
+				Key:   milestoneKey,
+				Value: milestoneValue,
+			},
+		}
+
+		msgToSend := message.NewRequestMessage(c.EthAddress, peerEthAddr, reqID, requestPayload, clockCopy, "")
+
+		if err := c.signMessage(msgToSend); err != nil {
+			fmt.Printf("Node %d: Failed to sign milestone message: %v\n", c.ID, err)
+			continue
+		}
+
+		if err := c.sendMessage("", msgToSend); err != nil {
+			fmt.Printf("Node %d: Failed to send milestone to %s: %v\n", c.ID, peerEthAddr, err)
+		} else {
+			fmt.Printf("Node %d: Broadcast milestone %s to %s\n", c.ID, milestoneKey, peerEthAddr)
+		}
+	}
+}
+
+func (c *Client) parseClockString(clockStr string) map[int]int {
+	eventClock := make(map[int]int)
+
+	// Simple parsing of clock format like "map[1:5 2:3]"
+	clockStr = strings.TrimPrefix(clockStr, "map[")
+	clockStr = strings.TrimSuffix(clockStr, "]")
+
+	if clockStr != "" {
+		pairs := strings.Split(clockStr, " ")
+		for _, pair := range pairs {
+			if strings.Contains(pair, ":") {
+				parts := strings.Split(pair, ":")
+				if len(parts) == 2 {
+					if key, err := strconv.Atoi(parts[0]); err == nil {
+						if value, err := strconv.Atoi(parts[1]); err == nil {
+							eventClock[key] = value
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return eventClock
+}
+
+// isImmediateCausalPredecessor checks if storedClock is an immediate causal predecessor of currentClock
+func (c *Client) isImmediateCausalPredecessor(storedClock, currentClock map[int]int) bool {
+	// For an event to be an immediate causal predecessor, it should be:
+	// 1. Exactly one step behind in the vector clock (not just any "happened before")
+	// 2. From the same node or a directly related communication
+
+	// Count how many clock values differ and by how much
+	differences := 0
+	totalDifference := 0
+
+	// Check all nodes in both clocks
+	allNodes := make(map[int]bool)
+	for k := range storedClock {
+		allNodes[k] = true
+	}
+	for k := range currentClock {
+		allNodes[k] = true
+	}
+
+	for nodeID := range allNodes {
+		storedValue := storedClock[nodeID]   // defaults to 0 if not present
+		currentValue := currentClock[nodeID] // defaults to 0 if not present
+
+		if storedValue > currentValue {
+			// Stored event is in the future relative to current - not a predecessor
+			return false
+		}
+
+		if currentValue > storedValue {
+			differences++
+			totalDifference += (currentValue - storedValue)
+		}
+	}
+
+	// For immediate causality, we want:
+	// - Exactly 1 or 2 clock positions to differ (indicating direct communication)
+	// - Total difference should be small (1-3 steps max)
+	return differences > 0 && differences <= 2 && totalDifference <= 3
 }
