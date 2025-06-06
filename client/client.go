@@ -390,7 +390,7 @@ func (c *Client) checkCanApplyDirectWrite(incomingMsg *message.Message) (
 	comparison := localClock.Compare(remoteClock)
 	if comparison == vlc.Less { // We are strictly behind, and it's not a simple +1 increment
 		fmt.Printf("Node %d [G:%d]: Apply rule: GAP_DETECTED (local < remote, not +1). Requires Sync.\n", c.ID, goid())
-		return 0, false // TODO set to false, but need to sync the k/v behind the outran state
+		return 0, true
 	}
 	// If local is Greater, Equal, or Incomparable (but not strictly Less and not +1)
 	fmt.Printf("Node %d [G:%d]: Apply rule: IGNORE/NO_ACTION (local %v vs remote %v, comp %d not meeting other criteria).\n", c.ID, goid(), localClock.Values, remoteClock.Values, comparison)
@@ -1157,12 +1157,13 @@ func (c *Client) recordMilestoneEvent(msg *message.Message, epochEvents []string
 
 	parentIDs := make([]string, 0)
 
-	// CORRECTED LOGIC: Only connect to events from the current epoch
+	// CORRECTED LOGIC: Only connect to LEAF events from the current epoch
 	if len(epochEvents) > 0 {
-		// Use the provided epoch events - these are exactly the events from this epoch
-		parentIDs = append(parentIDs, epochEvents...)
-		fmt.Printf("Node %d: Milestone %s connecting to epoch events: %v\n",
-			c.ID, eventName, epochEvents)
+		// Find leaf events (events with no children) within the epoch
+		leafEvents := c.findLeafEvents(epochEvents)
+		parentIDs = append(parentIDs, leafEvents...)
+		fmt.Printf("Node %d: Milestone %s connecting to LEAF epoch events only: %v\n",
+			c.ID, eventName, leafEvents)
 	} else {
 		// For received milestones, find events that occurred after the previous milestone
 		// but before this milestone (i.e., events from this epoch only)
@@ -1203,6 +1204,7 @@ func (c *Client) recordMilestoneEvent(msg *message.Message, epochEvents []string
 
 			// Find all non-milestone events that occurred after the previous milestone
 			// but before this milestone (epoch events)
+			epochEventsForReceived := make([]string, 0)
 			for storedName, eventID := range c.lastMessageEvents {
 				// Skip milestone events, timestamp entries, clock entries
 				if strings.HasPrefix(storedName, "M") ||
@@ -1247,13 +1249,18 @@ func (c *Client) recordMilestoneEvent(msg *message.Message, epochEvents []string
 					// If event occurred after previous milestone and before current milestone,
 					// it's part of this epoch
 					if occurredAfterPrev && occurredBeforeCurrent {
-						parentIDs = append(parentIDs, eventID)
+						epochEventsForReceived = append(epochEventsForReceived, eventID)
 					}
 				}
 			}
 
-			fmt.Printf("Node %d: Received milestone %s connecting to epoch events (after prev milestone): %v\n",
-				c.ID, eventName, parentIDs)
+			// Now find only the leaf events from the epoch events
+			if len(epochEventsForReceived) > 0 {
+				leafEvents := c.findLeafEvents(epochEventsForReceived)
+				parentIDs = append(parentIDs, leafEvents...)
+				fmt.Printf("Node %d: Received milestone %s connecting to LEAF epoch events only: %v\n",
+					c.ID, eventName, leafEvents)
+			}
 		} else {
 			// Fallback: connect to the most recent milestone if no epoch events found
 			for storedName, eventID := range c.lastMessageEvents {
@@ -1739,4 +1746,85 @@ func (c *Client) isImmediateCausalPredecessor(storedClock, currentClock map[int]
 	// - Exactly 1 or 2 clock positions to differ (indicating direct communication)
 	// - Total difference should be small (1-3 steps max)
 	return differences > 0 && differences <= 2 && totalDifference <= 3
+}
+
+// Helper function to find leaf events (events with no children) within a given set of events
+func (c *Client) findLeafEvents(epochEvents []string) []string {
+	if len(epochEvents) == 0 {
+		return epochEvents
+	}
+
+	hasChildren := make(map[string]bool)
+
+	for _, eventID := range epochEvents {
+		var eventName string
+		for name, id := range c.lastMessageEvents {
+			if id == eventID {
+				eventName = name
+				break
+			}
+		}
+
+		if eventName == "" {
+			continue
+		}
+
+		for _, otherEventID := range epochEvents {
+			if eventID == otherEventID {
+				continue
+			}
+
+			var otherEventName string
+			for name, id := range c.lastMessageEvents {
+				if id == otherEventID {
+					otherEventName = name
+					break
+				}
+			}
+
+			if otherEventName == "" {
+				continue
+			}
+
+			if c.isParentOf(eventID, otherEventID) {
+				hasChildren[eventID] = true
+				fmt.Printf("Node %d: Event %s (ID: %s) has child %s (ID: %s) in epoch\n",
+					c.ID, eventName, eventID, otherEventName, otherEventID)
+				break
+			}
+		}
+	}
+
+	leafEvents := make([]string, 0)
+	for _, eventID := range epochEvents {
+		if !hasChildren[eventID] {
+			leafEvents = append(leafEvents, eventID)
+		}
+	}
+
+	fmt.Printf("Node %d: Found %d leaf events out of %d total epoch events\n",
+		c.ID, len(leafEvents), len(epochEvents))
+
+	return leafEvents
+}
+
+// Helper function to check if parentEventID is a parent of childEventID
+func (c *Client) isParentOf(parentEventID, childEventID string) bool {
+	c.EventGraph.EventMu.RLock()
+	defer c.EventGraph.EventMu.RUnlock()
+
+	for _, event := range c.EventGraph.Events {
+		if event.ID == childEventID {
+			for _, parent := range event.Parent {
+				for storedEventID, storedUID := range c.EventGraph.UIDMap {
+					if storedUID == parent.UID && storedEventID == parentEventID {
+						return true
+					}
+				}
+			}
+			break
+		}
+	}
+
+	return false
 }
