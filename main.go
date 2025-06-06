@@ -372,6 +372,43 @@ func main() {
 	fmt.Println("   Waiting for M:2 milestone creation and propagation...")
 	time.Sleep(15 * time.Second)
 
+	fmt.Println("\n=== PHASE 5: Events after M:2 milestone ===")
+
+	fmt.Println("\n---> Step 31: N3 writes k31=v31 (sends to N4)")
+	err = node3.Write("k31", "v31", node4.EthAddress)
+	if err != nil {
+		fmt.Printf("!!! N3 Write k31 failed: %v\n", err)
+	}
+	time.Sleep(2 * time.Second)
+
+	fmt.Println("\n---> Step 32: N4 writes k32=v32 (sends to N1)")
+	err = node4.Write("k32", "v32", node1.EthAddress)
+	if err != nil {
+		fmt.Printf("!!! N4 Write k32 failed: %v\n", err)
+	}
+	time.Sleep(2 * time.Second)
+
+	fmt.Println("\n---> Step 33: N1 writes k33=v33 (sends to N2)")
+	err = node1.Write("k33", "v33", node2.EthAddress)
+	if err != nil {
+		fmt.Printf("!!! N1 Write k33 failed: %v\n", err)
+	}
+	time.Sleep(2 * time.Second)
+
+	fmt.Println("\n---> Step 34: N2 writes k34=v34 (sends to N3)")
+	err = node2.Write("k34", "v34", node3.EthAddress)
+	if err != nil {
+		fmt.Printf("!!! N2 Write k34 failed: %v\n", err)
+	}
+	time.Sleep(2 * time.Second)
+
+	fmt.Println("\n---> Step 35: N3 writes k35=v35 (sends to N4)")
+	err = node3.Write("k35", "v35", node4.EthAddress)
+	if err != nil {
+		fmt.Printf("!!! N3 Write k35 failed: %v\n", err)
+	}
+	time.Sleep(2 * time.Second)
+
 	fmt.Println("\nWaiting for final synchronization...")
 	time.Sleep(8 * time.Second)
 
@@ -420,6 +457,7 @@ func main() {
 
 	fmt.Println("\n--- Execution Complete ---")
 	fmt.Println("Expected milestones: M0 (genesis), M:1 (after 5 writes), M:2 (after 10 writes)")
+	fmt.Println("Total experiment steps: 35 (5 phases)")
 	fmt.Println("Chrono event graph committed to Dgraph.")
 	fmt.Println("Visit http://localhost:8000 to view the graph in Ratel UI")
 	time.Sleep(2 * time.Second)

@@ -119,7 +119,7 @@ This PoCW logic can be implemented using a smart contract irrespective of the un
 
 ## 4-Node Experiment
 
-This experiment demonstrates milestone creation in a distributed P2P network with 4 nodes using vector clocks and epoch-based consensus. The experiment is designed to create exactly 3 milestones (M0, M:1, M:2) through a controlled sequence of 30 write operations across 4 phases.
+This experiment demonstrates milestone creation in a distributed P2P network with 4 nodes using vector clocks and epoch-based consensus. The experiment is designed to create exactly 3 milestones (M0, M:1, M:2) through a controlled sequence of 35 write operations across 5 phases.
 
 ### Experiment Design
 
@@ -140,10 +140,13 @@ This experiment demonstrates milestone creation in a distributed P2P network wit
    - 5 more write operations
 4. **Phase 4 (Steps 26-30)**: Final events to guarantee milestone completion
    - 5 final write operations to ensure all nodes reach consensus
+5. **Phase 5 (Steps 31-35)**: Events after M:2 milestone
+   - 5 additional write operations (k31-k35) in round-robin fashion
+   - Demonstrates continued operation after milestone creation
 
 ### 4-Node Experiment Results
 
-The final states of the nodes after all 30 steps and successful milestone creation demonstrate the distributed consensus mechanism:
+The final states of the nodes after all 35 steps and successful milestone creation demonstrate the distributed consensus mechanism:
 
 ```
 Node 1 (0x96216849c49358B10257cb55b28eA603c874b05E):
@@ -180,6 +183,7 @@ Node 4 (0xA62C4BC6D1B32d44Fef7618290F478036071806C):
 - Each node stores approximately 8-9 regular key-value pairs plus the 3 milestones
 - Events are distributed based on the P2P message routing patterns
 - Vector clocks demonstrate proper causal relationship tracking across all nodes
+- Phase 5 demonstrates continued network operation after milestone creation with events k31-k35
 
 ### Visualization
 
